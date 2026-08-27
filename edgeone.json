@@ -1,0 +1,37 @@
+{
+  "cloudFunctions": {
+    "mainlandRegions": ["ap-shanghai"],
+    "overseasRegions": ["ap-hongkong"],
+    "nodejs": {
+      "maxDuration": 60
+    }
+  },
+  "nodeFunctionsConfig": {
+    "maxDuration": 60
+  },
+  "headers": [
+    {
+      "source": "/assets/*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=31536000, immutable"
+        }
+      ]
+    },
+    {
+      "source": "/*.png",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=604800"
+        }
+      ]
+    }
+  ],
+  "caches": [
+    { "source": "/assets/*", "cacheTtl": 31536000 },
+    { "source": "/*.png", "cacheTtl": 604800 },
+    { "source": "/manifest.webmanifest", "cacheTtl": 3600 }
+  ]
+}

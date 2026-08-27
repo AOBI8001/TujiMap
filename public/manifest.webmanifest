@@ -1,0 +1,11 @@
+{
+  "name": "途迹｜城市环线规划",
+  "short_name": "途迹",
+  "description": "随心成行，按途索迹。",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f3eb",
+  "theme_color": "#17211e",
+  "lang": "zh-CN",
+  "icons": [{ "src": "/tuji-logo.png", "sizes": "256x256", "type": "image/png", "purpose": "any maskable" }]
+}
