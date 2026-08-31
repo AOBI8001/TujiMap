@@ -266,30 +266,45 @@ function loadAmap() {
           ).href.replace(/\/$/, ""),
         }
       : { securityJsCode: config.securityCode };
-    await new Promise<void>((resolve, reject) => {
-      const old = document.getElementById(
-        "amap-sdk",
-      ) as HTMLScriptElement | null;
-      if (old && !(window as any).AMap) old.remove();
-      const script = document.createElement("script");
-      script.id = "amap-sdk";
-      script.src = `https://webapi.amap.com/maps?v=2.0&key=${config.key}`;
-      const timer = window.setTimeout(() => {
-        script.remove();
-        reject(new Error("高德地图加载超时"));
-      }, 15000);
-      script.onload = () => {
-        window.clearTimeout(timer);
-        (window as any).AMap
-          ? resolve()
-          : reject(new Error("高德地图鉴权失败"));
-      };
-      script.onerror = () => {
-        window.clearTimeout(timer);
-        reject(new Error("高德地图脚本加载失败"));
-      };
-      document.head.appendChild(script);
-    });
+    let scriptError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const old = document.getElementById(
+            "amap-sdk",
+          ) as HTMLScriptElement | null;
+          if (old && !(window as any).AMap) old.remove();
+          const script = document.createElement("script");
+          script.id = "amap-sdk";
+          script.src = `https://webapi.amap.com/maps?v=2.0&key=${config.key}`;
+          const timer = window.setTimeout(
+            () => {
+              script.remove();
+              reject(new Error("高德地图加载超时"));
+            },
+            attempt === 0 ? 12000 : 18000,
+          );
+          script.onload = () => {
+            window.clearTimeout(timer);
+            (window as any).AMap
+              ? resolve()
+              : reject(new Error("高德地图鉴权失败"));
+          };
+          script.onerror = () => {
+            window.clearTimeout(timer);
+            reject(new Error("高德地图脚本加载失败"));
+          };
+          document.head.appendChild(script);
+        });
+        scriptError = undefined;
+        break;
+      } catch (error) {
+        scriptError = error;
+        if (attempt === 0)
+          await new Promise((resolve) => window.setTimeout(resolve, 450));
+      }
+    }
+    if (scriptError) throw scriptError;
     return (window as any).AMap;
   })().catch((error) => {
     amapLoader = null;
@@ -3796,6 +3811,9 @@ export default function App() {
   useEffect(() => {
     if (!city) return;
     let active = true;
+    // 选城后同步预热地图 SDK，把首次连接等待隐藏在设置阶段；若高德脚本
+    // 偶发超时，loadAmap 会自动重试，不让地图页直接停在空底图状态。
+    void loadAmap().catch(() => undefined);
     void prepareCityCached(city).then((prepared) => {
       cityCache.current.set(city.id, prepared);
       if (active)
