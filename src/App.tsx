@@ -101,6 +101,7 @@ const placeQueryCache = new Map<
 >();
 const placeQueryInflight = new Map<string, Promise<any[]>>();
 const attractionImagePreloads = new Map<string, Promise<boolean>>();
+const attractionImageReadySources = new Set<string>();
 const preparedCityPromises = new Map<CityId, Promise<CityConfig>>();
 
 function preloadAttractionImage(source?: string) {
@@ -117,7 +118,11 @@ function preloadAttractionImage(source?: string) {
       if (settled) return;
       settled = true;
       window.clearTimeout(timeout);
-      if (!ok) attractionImagePreloads.delete(source);
+      if (ok) attractionImageReadySources.add(source);
+      else {
+        attractionImageReadySources.delete(source);
+        attractionImagePreloads.delete(source);
+      }
       resolve(ok);
     };
     const timeout = window.setTimeout(() => finish(false), 7000);
@@ -1666,6 +1671,9 @@ function SwipeCard({
   const [leaving, setLeaving] = useState<"left" | "right" | null>(null);
   const [showGuide, setShowGuide] = useState(true);
   const [photoFailed, setPhotoFailed] = useState(false);
+  const [photoLoaded, setPhotoLoaded] = useState(
+    () => !!spot?.photo && attractionImageReadySources.has(spot.photo),
+  );
   const startRef = useRef({ x: 0, y: 0 });
   useEffect(() => {
     const timer = window.setTimeout(() => setShowGuide(false), 6800);
@@ -1675,6 +1683,9 @@ function SwipeCard({
     setDrag({ x: 0, y: 0, active: false });
     setLeaving(null);
     setPhotoFailed(false);
+    setPhotoLoaded(
+      !!spot?.photo && attractionImageReadySources.has(spot.photo),
+    );
   }, [spot?.id]);
   const down = (event: React.PointerEvent) => {
     startRef.current = { x: event.clientX, y: event.clientY };
@@ -1743,7 +1754,7 @@ function SwipeCard({
           }}
         >
           <div
-            className={`swipe-art ${spot.photo && !photoFailed ? "has-photo" : ""}`}
+            className={`swipe-art ${spot.photo && photoLoaded && !photoFailed ? "has-photo" : ""}`}
           >
             {spot.photo && !photoFailed && (
               <img
@@ -1751,10 +1762,14 @@ function SwipeCard({
                 src={spot.photo}
                 alt=""
                 draggable={false}
+                onLoad={() => {
+                  attractionImageReadySources.add(spot.photo!);
+                  setPhotoLoaded(true);
+                }}
                 onError={() => setPhotoFailed(true)}
               />
             )}
-            {(!spot.photo || photoFailed) && (
+            {(!spot.photo || !photoLoaded || photoFailed) && (
               <span className="spot-letter">{spot.name.slice(0, 1)}</span>
             )}
             <div

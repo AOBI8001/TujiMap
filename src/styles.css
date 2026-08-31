@@ -5206,6 +5206,11 @@ button.deck-launcher:not(.finished):hover {
   object-position: center;
   user-select: none;
   pointer-events: none;
+  opacity: 0;
+  transition: opacity 160ms ease-out;
+}
+.swipe-art.has-photo .spot-photo {
+  opacity: 1;
 }
 .swipe-art.has-photo::before {
   inset: 0;
