@@ -4189,6 +4189,24 @@ button.deck-launcher:not(.finished):hover {
   }
 }
 
+.deck-launcher:disabled {
+  cursor: progress;
+  opacity: 0.86;
+}
+
+.deck-launcher:disabled .deck-icon {
+  animation: card-warm-pulse 1.1s ease-in-out infinite alternate;
+}
+
+@keyframes card-warm-pulse {
+  from { transform: scale(0.96); opacity: 0.72; }
+  to { transform: scale(1.04); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .deck-launcher:disabled .deck-icon { animation: none; }
+}
+
 @media (max-width: 760px) {
   .setup-screen {
     height: 100dvh;

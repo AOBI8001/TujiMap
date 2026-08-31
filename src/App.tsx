@@ -99,7 +99,9 @@ const placeQueryCache = new Map<
   string,
   { expires: number; pois: any[] }
 >();
+const placeQueryInflight = new Map<string, Promise<any[]>>();
 const attractionImagePreloads = new Map<string, Promise<boolean>>();
+const preparedCityPromises = new Map<CityId, Promise<CityConfig>>();
 
 function preloadAttractionImage(source?: string) {
   if (!source) return Promise.resolve(false);
@@ -109,24 +111,59 @@ function preloadAttractionImage(source?: string) {
   const request = new Promise<boolean>((resolve) => {
     const image = new Image();
     image.decoding = "async";
+    image.fetchPriority = "high";
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      if (!ok) attractionImagePreloads.delete(source);
+      resolve(ok);
+    };
+    const timeout = window.setTimeout(() => finish(false), 7000);
     image.onload = async () => {
       try {
         await image.decode?.();
       } catch {
         // The decoded bitmap is an optimisation only; the HTTP cache is ready.
       }
-      resolve(true);
+      finish(true);
     };
-    image.onerror = () => {
-      // Allow the card itself to retry after a transient network failure.
-      attractionImagePreloads.delete(source);
-      resolve(false);
-    };
+    image.onerror = () => finish(false);
     image.src = source;
   });
 
   attractionImagePreloads.set(source, request);
   return request;
+}
+
+async function preloadAttractionImages(spots: Spot[]) {
+  const sources = Array.from(
+    new Set(spots.map((spot) => spot.photo).filter(Boolean) as string[]),
+  );
+  const direct = sources.filter((source) => source.includes("?url="));
+  const fallback = sources.filter((source) => !source.includes("?url="));
+  let cursor = 0;
+  const warmDirect = async () => {
+    while (cursor < direct.length) {
+      const source = direct[cursor++];
+      await preloadAttractionImage(source);
+    }
+  };
+  await Promise.allSettled(
+    Array.from({ length: Math.min(6, direct.length) }, () => warmDirect()),
+  );
+  // 需要按名称查询的图片会消耗高德关键字搜索配额，保持低并发后台补齐。
+  let fallbackCursor = 0;
+  const warmFallback = async () => {
+    while (fallbackCursor < fallback.length) {
+      const source = fallback[fallbackCursor++];
+      await preloadAttractionImage(source);
+    }
+  };
+  await Promise.allSettled(
+    Array.from({ length: Math.min(2, fallback.length) }, () => warmFallback()),
+  );
 }
 
 function sameOriginUrl(path: string) {
@@ -141,25 +178,42 @@ async function searchServerPlaces(
   const cacheKey = `${cityName}:${keyword.trim()}:${page}`;
   const cached = placeQueryCache.get(cacheKey);
   if (cached && cached.expires > Date.now()) return cached.pois;
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 6000);
+  const inflight = placeQueryInflight.get(cacheKey);
+  if (inflight) return inflight;
+  const request = (async () => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 4800);
+    try {
+      const response = await fetch(
+        sameOriginUrl(
+          `/api/places?city=${encodeURIComponent(cityName)}&keywords=${encodeURIComponent(keyword)}&page=${page}`,
+        ),
+        { signal: controller.signal },
+      );
+      const raw = await response.text();
+      let data: any = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error("地点服务响应异常");
+      }
+      if (!response.ok || !Array.isArray(data.pois))
+        throw new Error(data.error || "地点服务不可用");
+      placeQueryCache.set(cacheKey, {
+        pois: data.pois,
+        expires: Date.now() + 30 * 60 * 1000,
+      });
+      return data.pois;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  })();
+  placeQueryInflight.set(cacheKey, request);
   try {
-    const response = await fetch(
-      sameOriginUrl(
-        `/api/places?city=${encodeURIComponent(cityName)}&keywords=${encodeURIComponent(keyword)}&page=${page}`,
-      ),
-      { signal: controller.signal },
-    );
-    const data = await response.json();
-    if (!response.ok || !Array.isArray(data.pois))
-      throw new Error(data.error || "地点服务不可用");
-    placeQueryCache.set(cacheKey, {
-      pois: data.pois,
-      expires: Date.now() + 30 * 60 * 1000,
-    });
-    return data.pois;
+    return await request;
   } finally {
-    window.clearTimeout(timeout);
+    if (placeQueryInflight.get(cacheKey) === request)
+      placeQueryInflight.delete(cacheKey);
   }
 }
 
@@ -248,7 +302,7 @@ async function searchAmapPlaces(
   return new Promise<any[]>((resolve, reject) => {
     const timer = window.setTimeout(
       () => reject(new Error("地点搜索超时")),
-      10000,
+      4500,
     );
     AMap.plugin("AMap.PlaceSearch", () => {
       const service = new AMap.PlaceSearch({
@@ -406,6 +460,14 @@ async function prepareCity(city: CityConfig): Promise<CityConfig> {
     mapTarget: Math.max(city.mapTarget, Math.min(48, merged.length)),
     spots: merged.slice(0, 48),
   };
+}
+
+function prepareCityCached(city: CityConfig) {
+  const cached = preparedCityPromises.get(city.id);
+  if (cached) return cached;
+  const request = prepareCity(city).catch(() => city);
+  preparedCityPromises.set(city.id, request);
+  return request;
 }
 
 function poiLocation(poi: any) {
@@ -822,7 +884,7 @@ function PlaceField({
       } catch {
         if (!cancelled) setResults([]);
       }
-    }, 480);
+    }, 260);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
@@ -2599,7 +2661,7 @@ function MapSearch({
       } catch {
         if (!cancelled) setResults([]);
       }
-    }, 480);
+    }, 260);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
@@ -2909,6 +2971,7 @@ function Planner({
     walking: emptyRoutes(days, initialEndpoints),
   });
   const [planning, setPlanning] = useState(false);
+  const [cardImagesReady, setCardImagesReady] = useState(false);
   const [activeDay, setActiveDay] = useState(0);
   const [activeSpot, setActiveSpot] = useState<Spot | null>(null);
   const [focusSpot, setFocusSpot] = useState<Spot | null>(null);
@@ -2922,31 +2985,22 @@ function Planner({
   const [textScale, setTextScale] = useState(1);
   const routeCache = useRef(new Map<string, RouteSegment>());
 
-  // Start warming every popular-card image as soon as the map page opens.
-  // A small worker pool keeps the page responsive and stays within the
-  // upstream search service's free-tier request rate for fallback photos.
+  // 城市选择后 App 已开始预取；地图页继续等待全部热门卡片图片完成解码，
+  // 用户打开卡片后连续滑动不会再逐张等待网络。
   useEffect(() => {
     let cancelled = false;
-    const sources = Array.from(
-      new Set(cardSpots.map((spot) => spot.photo).filter(Boolean) as string[]),
-    );
-    let cursor = 0;
-
-    const warmNext = async () => {
-      while (!cancelled && cursor < sources.length) {
-        const source = sources[cursor++];
-        await preloadAttractionImage(source);
-      }
-    };
-
-    const workers = Array.from(
-      { length: Math.min(3, sources.length) },
-      () => warmNext(),
-    );
-    void Promise.allSettled(workers);
+    setCardImagesReady(false);
+    let deadline = 0;
+    const timeLimit = new Promise<void>((resolve) => {
+      deadline = window.setTimeout(resolve, 15000);
+    });
+    void Promise.race([preloadAttractionImages(cardSpots), timeLimit]).then(() => {
+      if (!cancelled) setCardImagesReady(true);
+    });
 
     return () => {
       cancelled = true;
+      window.clearTimeout(deadline);
     };
   }, [city.id, cardSpots]);
 
@@ -3168,18 +3222,29 @@ function Planner({
           };
         let response: Response;
         let data: any = {};
+        const segmentController = new AbortController();
+        const abortSegment = () => segmentController.abort();
+        controller.signal.addEventListener("abort", abortSegment, { once: true });
+        const segmentTimeout = window.setTimeout(abortSegment, 10000);
         try {
           response = await fetch(
             sameOriginUrl(
               `/api/route?origin=${point.location}&destination=${destination.location}&mode=${mode}&city=${encodeURIComponent(city.routeCity)}`,
             ),
-            { signal: controller.signal },
+            { signal: segmentController.signal },
           );
           const raw = await response.text();
           data = raw ? JSON.parse(raw) : {};
         } catch (reason) {
           if (controller.signal.aborted) throw reason;
-          throw new Error("路线服务网络波动");
+          throw new Error(
+            segmentController.signal.aborted
+              ? "路线请求超时"
+              : "路线服务网络波动",
+          );
+        } finally {
+          window.clearTimeout(segmentTimeout);
+          controller.signal.removeEventListener("abort", abortSegment);
         }
         if (
           response.ok &&
@@ -3216,30 +3281,42 @@ function Planner({
               points.length === 2 &&
               samePlace(endpoint.origin, endpoint.destination)
             )
-          )
-            for (let index = 0; index < points.length - 1; index++) {
-              try {
-                const result = await fetchSegment(
-                  mode,
-                  points[index],
-                  points[index + 1],
-                );
-                segments.push(result.segment);
-                // 只有真实发出高德请求时才限速；缓存路线立即复用。
-                if (result.fetched)
-                  await new Promise((resolve) =>
-                    window.setTimeout(resolve, 420),
+          ) {
+            const segmentResults: Array<RouteSegment | null> = Array.from(
+              { length: points.length - 1 },
+              () => null,
+            );
+            let cursor = 0;
+            const buildNext = async () => {
+              while (!controller.signal.aborted && cursor < points.length - 1) {
+                const index = cursor++;
+                try {
+                  const result = await fetchSegment(
+                    mode,
+                    points[index],
+                    points[index + 1],
                   );
-              } catch (reason) {
-                if (controller.signal.aborted) throw reason;
-                failures.push(
-                  `第${dayIndex + 1}天 ${points[index].name}→${points[index + 1].name}：${reason instanceof Error ? reason.message : "生成失败"}`,
-                );
-                await new Promise((resolve) =>
-                  window.setTimeout(resolve, 420),
-                );
+                  segmentResults[index] = result.segment;
+                } catch (reason) {
+                  if (controller.signal.aborted) throw reason;
+                  failures.push(
+                    `第${dayIndex + 1}天 ${points[index].name}→${points[index + 1].name}：${reason instanceof Error ? reason.message : "生成失败"}`,
+                  );
+                }
               }
-            }
+            };
+            await Promise.all(
+              Array.from(
+                { length: Math.min(2, points.length - 1) },
+                () => buildNext(),
+              ),
+            );
+            segments.push(
+              ...segmentResults.filter(
+                (segment): segment is RouteSegment => Boolean(segment),
+              ),
+            );
+          }
           next.push({
             day: dayIndex + 1,
             color: DAY_COLORS[dayIndex],
@@ -3632,7 +3709,11 @@ function Planner({
         </button>
       </div>
       {!cardOpen && (
-        <button className="deck-launcher" onClick={openCards}>
+        <button
+          className="deck-launcher"
+          onClick={openCards}
+          disabled={!cardImagesReady}
+        >
           <span className="deck-icon">
             <i />
             <i />
@@ -3640,7 +3721,9 @@ function Planner({
           <div>
             <b>热门景点卡片</b>
             <small>
-              {cardsDone
+              {!cardImagesReady
+                ? "图片准备中"
+                : cardsDone
                 ? `${selected.length} 个想去`
                 : `还剩 ${Math.max(0, cardSpots.length - decided)} 个`}
             </small>
@@ -3695,6 +3778,18 @@ export default function App() {
   const [entering, setEntering] = useState(false);
   const cityCache = useRef(new Map<CityId, CityConfig>());
   const city = cityId ? cityById(cityId) : null;
+  useEffect(() => {
+    if (!city) return;
+    let active = true;
+    void prepareCityCached(city).then((prepared) => {
+      cityCache.current.set(city.id, prepared);
+      if (active)
+        void preloadAttractionImages(selectCardSpots(prepared.spots));
+    });
+    return () => {
+      active = false;
+    };
+  }, [city?.id]);
   const enter = async () => {
     if (!city || entering) return;
     const cached = cityCache.current.get(city.id);
@@ -3703,19 +3798,18 @@ export default function App() {
       setScreen("planner");
       return;
     }
-    // 先用内置城市数据立即显示地图，高德补充景点在后台渐进合并。
-    // 网络慢时不再把用户阻塞在“正在载入城市景点”。
-    setPreparedCity(city);
-    setScreen("planner");
     setEntering(true);
-    void prepareCity(city)
-      .then((prepared) => {
-        cityCache.current.set(city.id, prepared);
-        setPreparedCity((current) =>
-          current?.id === prepared.id ? prepared : current,
-        );
-      })
-      .finally(() => setEntering(false));
+    try {
+      // 城市选择后已在后台预取；这里确保拿到真实中心与 citycode 再进入，
+      // 避免公交 INVALID_PARAMS 与跨城步行 OVER_DIRECTION_RANGE。
+      const prepared = await prepareCityCached(city);
+      cityCache.current.set(city.id, prepared);
+      setPreparedCity(prepared);
+      setScreen("planner");
+      void preloadAttractionImages(selectCardSpots(prepared.spots));
+    } finally {
+      setEntering(false);
+    }
   };
   const chooseCity = (id: CityId) => {
     setCityId(id);
