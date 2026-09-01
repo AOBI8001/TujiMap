@@ -146,8 +146,10 @@ async function preloadAttractionImages(spots: Spot[]) {
   const sources = Array.from(
     new Set(spots.map((spot) => spot.photo).filter(Boolean) as string[]),
   );
-  const direct = sources.filter((source) => source.includes("?url="));
-  const fallback = sources.filter((source) => !source.includes("?url="));
+  const fallback = sources.filter((source) =>
+    source.startsWith("/api/amap-photo?city="),
+  );
+  const direct = sources.filter((source) => !fallback.includes(source));
   let cursor = 0;
   const warmDirect = async () => {
     while (cursor < direct.length) {
@@ -501,7 +503,18 @@ function poiPhoto(poi: any) {
   const source = String(poi?.photo || poi?.photos?.[0]?.url || "").trim();
   if (!source) return "";
   if (source.startsWith("/api/amap-photo?")) return source;
-  // 经同源服务转发，统一处理高德旧 HTTP 图片、防盗链与跨域失败。
+  try {
+    const target = new URL(source);
+    if (
+      /^https?:$/.test(target.protocol) &&
+      /(^|\.)(amap\.com|autonavi\.com)$/i.test(target.hostname)
+    ) {
+      target.protocol = "https:";
+      return target.href;
+    }
+  } catch {
+    // 非标准地址继续交由同源图片接口校验。
+  }
   return `/api/amap-photo?url=${encodeURIComponent(source)}`;
 }
 
@@ -3250,46 +3263,70 @@ function Planner({
             },
             fetched: false,
           };
-        let response: Response;
-        let data: any = {};
-        const segmentController = new AbortController();
-        const abortSegment = () => segmentController.abort();
-        controller.signal.addEventListener("abort", abortSegment, { once: true });
-        const segmentTimeout = window.setTimeout(abortSegment, 10000);
-        try {
-          response = await fetch(
-            sameOriginUrl(
-              `/api/route?origin=${point.location}&destination=${destination.location}&mode=${mode}&city=${encodeURIComponent(city.routeCity)}`,
-            ),
-            { signal: segmentController.signal },
-          );
-          const raw = await response.text();
-          data = raw ? JSON.parse(raw) : {};
-        } catch (reason) {
-          if (controller.signal.aborted) throw reason;
-          throw new Error(
-            segmentController.signal.aborted
-              ? "路线请求超时"
-              : "路线服务网络波动",
-          );
-        } finally {
-          window.clearTimeout(segmentTimeout);
-          controller.signal.removeEventListener("abort", abortSegment);
+        let lastReason = new Error("路线服务网络波动");
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          const segmentController = new AbortController();
+          const abortSegment = () => segmentController.abort();
+          controller.signal.addEventListener("abort", abortSegment, {
+            once: true,
+          });
+          const segmentTimeout = window.setTimeout(abortSegment, 12000);
+          try {
+            const response = await fetch(
+              sameOriginUrl(
+                `/api/route?origin=${point.location}&destination=${destination.location}&mode=${mode}&city=${encodeURIComponent(city.routeCity)}`,
+              ),
+              { signal: segmentController.signal },
+            );
+            const raw = await response.text();
+            let data: any = {};
+            try {
+              data = raw ? JSON.parse(raw) : {};
+            } catch {
+              // Cloudflare 运行时异常会返回纯文本 1101；下方按可重试错误处理。
+            }
+            if (
+              response.ok &&
+              (data.stationary ||
+                (Array.isArray(data.polyline) && data.polyline.length >= 2))
+            ) {
+              const segment = {
+                ...data,
+                fromName: point.name,
+                toName: destination.name,
+              } as RouteSegment;
+              routeCache.current.set(key, segment);
+              return { segment, fetched: true };
+            }
+            const message = String(
+              data.error ||
+                (response.status >= 500
+                  ? "路线服务网络波动"
+                  : "高德未返回真实路线"),
+            );
+            lastReason = new Error(message);
+            if (/距离超出|参数|不在当前城市/.test(message)) throw lastReason;
+          } catch (reason) {
+            if (controller.signal.aborted) throw reason;
+            lastReason = new Error(
+              segmentController.signal.aborted
+                ? "路线请求超时"
+                : reason instanceof Error
+                  ? reason.message
+                  : "路线服务网络波动",
+            );
+            if (/距离超出|参数|不在当前城市/.test(lastReason.message))
+              throw lastReason;
+          } finally {
+            window.clearTimeout(segmentTimeout);
+            controller.signal.removeEventListener("abort", abortSegment);
+          }
+          if (attempt < 3)
+            await new Promise((resolve) =>
+              window.setTimeout(resolve, 280 + attempt * 320),
+            );
         }
-        if (
-          response.ok &&
-          (data.stationary ||
-            (Array.isArray(data.polyline) && data.polyline.length >= 2))
-        ) {
-          const segment = {
-            ...data,
-            fromName: point.name,
-            toName: destination.name,
-          } as RouteSegment;
-          routeCache.current.set(key, segment);
-          return { segment, fetched: true };
-        }
-        throw new Error(String(data.error || "高德未返回真实路线"));
+        throw lastReason;
       };
       const buildMode = async (mode: TravelMode) => {
         const next: DayRoute[] = [];

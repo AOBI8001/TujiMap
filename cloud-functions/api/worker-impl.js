@@ -1,5 +1,3 @@
-import { request as httpsRequest } from "node:https";
-
 const json = (body, status = 200, headers = {}) =>
   new Response(JSON.stringify(body), {
     status,
@@ -38,21 +36,27 @@ const remember = (key, value, ttl) => {
 const drainAmapQueue = async (state) => {
   if (state.running) return;
   state.running = true;
-  while (state.queue.length) {
-    state.queue.sort(
-      (a, b) => b.priority - a.priority || a.sequence - b.sequence,
-    );
-    const job = state.queue.shift();
-    const elapsed = Date.now() - state.lastStarted;
-    if (elapsed < AMAP_MIN_INTERVAL) await sleep(AMAP_MIN_INTERVAL - elapsed);
-    state.lastStarted = Date.now();
-    try {
-      job.resolve(await job.task());
-    } catch (error) {
-      job.reject(error);
+  try {
+    while (state.queue.length) {
+      state.queue.sort(
+        (a, b) => b.priority - a.priority || a.sequence - b.sequence,
+      );
+      const job = state.queue.shift();
+      const elapsed = Date.now() - state.lastStarted;
+      if (elapsed < AMAP_MIN_INTERVAL) await sleep(AMAP_MIN_INTERVAL - elapsed);
+      state.lastStarted = Date.now();
+      try {
+        job.resolve(await job.task());
+      } catch (error) {
+        job.reject(error);
+      }
     }
+  } finally {
+    state.running = false;
+    // 有任务恰好在 while 判空与 running 复位之间入队时，重新启动排空，
+    // 避免该请求永远停在队列里，导致整次多点规划持续“规划中”。
+    if (state.queue.length) void drainAmapQueue(state);
   }
-  state.running = false;
 };
 
 let amapJobSequence = 0;
@@ -134,58 +138,30 @@ const collectPolyline = (value) => {
 const isAmapPhotoHost = (hostname) =>
   /(^|\.)(amap\.com|autonavi\.com)$/i.test(String(hostname || ""));
 
-async function fetchAmapPhoto(source) {
+function normalizeAmapPhoto(source) {
   let parsed;
   try {
     parsed = new URL(String(source || ""));
   } catch {
-    return null;
+    return "";
   }
   if (!/^https?:$/.test(parsed.protocol) || !isAmapPhotoHost(parsed.hostname))
-    return null;
-  const candidates = [
-    parsed.protocol === "http:"
-      ? String(parsed).replace(/^http:/i, "https:")
-      : String(parsed),
-    String(parsed),
-  ].filter((value, index, values) => values.indexOf(value) === index);
-  for (const candidate of candidates) {
-    try {
-      const response = await fetch(candidate, {
-        redirect: "follow",
-        headers: {
-          accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-          referer: "https://www.amap.com/",
-          "user-agent": "TujiMap/1.0",
-        },
-      });
-      const receivedType = response.headers.get("content-type") || "";
-      const extension = new URL(candidate).pathname.match(
-        /\.(jpe?g|png|webp|gif|avif)$/i,
-      )?.[1];
-      const inferredType = extension
-        ? extension.toLowerCase() === "jpg" || extension.toLowerCase() === "jpeg"
-          ? "image/jpeg"
-          : `image/${extension.toLowerCase()}`
-        : "";
-      const contentType = receivedType.toLowerCase().startsWith("image/")
-        ? receivedType
-        : inferredType;
-      if (!response.ok || !contentType) continue;
-      return new Response(response.body, {
-        status: 200,
-        headers: {
-          "content-type": contentType,
-          "cache-control":
-            "public, max-age=604800, s-maxage=2592000, stale-while-revalidate=86400",
-          "x-content-type-options": "nosniff",
-        },
-      });
-    } catch {
-      // 个别旧图片只支持 HTTP，继续尝试下一个受信任地址。
-    }
-  }
-  return null;
+    return "";
+  parsed.protocol = "https:";
+  return parsed.href;
+}
+
+function redirectAmapPhoto(source) {
+  const location = normalizeAmapPhoto(source);
+  if (!location) return null;
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location,
+      "cache-control":
+        "public, max-age=604800, s-maxage=2592000, stale-while-revalidate=86400",
+    },
+  });
 }
 
 const straightDistanceKm = (from, to) => {
@@ -199,47 +175,6 @@ const straightDistanceKm = (from, to) => {
     ) * 111.32
   );
 };
-
-// EdgeOne 的 Node Function 在部分区域会优先解析到不可达的 IPv6 地址，
-// 原生 fetch 最终只给出含义很弱的 `fetch failed`。高德接口统一强制 IPv4，
-// 同时设置明确超时，避免用户一直停留在“规划中”。
-const requestJsonV4 = (target, options = {}) =>
-  new Promise((resolve, reject) => {
-    const request = httpsRequest(
-      target,
-      {
-        method: options.method || "GET",
-        headers: options.headers || {},
-        family: 4,
-      },
-      (response) => {
-        const chunks = [];
-        response.on("data", (chunk) => chunks.push(chunk));
-        response.on("end", () => {
-          try {
-            const raw = Buffer.concat(chunks).toString("utf8");
-            resolve(raw ? JSON.parse(raw) : {});
-          } catch (error) {
-            reject(error);
-          }
-        });
-      },
-    );
-    request.setTimeout(options.timeout || 15000, () =>
-      request.destroy(new Error("UPSTREAM_TIMEOUT")),
-    );
-    request.on("error", reject);
-    if (options.body) request.write(options.body);
-    request.end();
-  });
-
-// Cloudflare Workers 原生 fetch 使用平台网络栈；node:https 兼容层在部分
-// 边缘节点会产生数秒延迟或 1101 运行时错误。本地与 EdgeOne 若原生 fetch
-// 失败，仍保留强制 IPv4 回退。
-const isCloudflareWorker = () =>
-  (typeof navigator !== "undefined" &&
-    /Cloudflare-Workers/i.test(String(navigator.userAgent || ""))) ||
-  typeof WebSocketPair !== "undefined";
 
 const requestJson = async (target, options = {}) => {
   const controller = new AbortController();
@@ -256,9 +191,6 @@ const requestJson = async (target, options = {}) => {
     });
     const raw = await response.text();
     return raw ? JSON.parse(raw) : {};
-  } catch (error) {
-    if (isCloudflareWorker()) throw error;
-    return requestJsonV4(target, options);
   } finally {
     clearTimeout(timeout);
   }
@@ -319,7 +251,7 @@ async function api(request, env, url) {
         candidates[0];
       source = String(matched?.photos?.[0]?.url || "");
     }
-    let photo = await fetchAmapPhoto(source);
+    let photo = redirectAmapPhoto(source);
     if (!photo && fallbackName) {
       const shorterName = fallbackName
         .replace(
@@ -350,7 +282,7 @@ async function api(request, env, url) {
           const fallbackSource = fallbackData?.pois?.find(
             (poi) => poi.photos?.[0]?.url,
           )?.photos?.[0]?.url;
-          photo = await fetchAmapPhoto(fallbackSource);
+          photo = redirectAmapPhoto(fallbackSource);
         } catch {
           // 继续使用无图占位，不影响卡片选择本身。
         }
@@ -560,14 +492,14 @@ async function api(request, env, url) {
           : "transit/integrated";
     const requestDirection = async (targetEndpoint, targetParams) => {
       let result = {};
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < 1; attempt++) {
         try {
           result = await scheduleAmap(
             `direction:${targetEndpoint}`,
             () =>
               requestJson(
                 `https://restapi.amap.com/v5/direction/${targetEndpoint}?${targetParams}`,
-                { timeout: 6500 },
+                { timeout: 5500 },
               ),
             10,
           );
@@ -586,12 +518,7 @@ async function api(request, env, url) {
           };
         }
         if (result.status === "1") break;
-        const retryable =
-          /QPS_HAS_EXCEEDED|SERVER_IS_BUSY|GATEWAY_TIMEOUT|ROUTE_TIMEOUT|ROUTE_NETWORK_ERROR/i.test(
-            String(result.info || ""),
-          );
-        if (!retryable || attempt === 1) break;
-        await sleep(650 + Math.random() * 250);
+        break;
       }
       return result;
     };
@@ -893,7 +820,7 @@ export async function handleApiRequest(request, env, context) {
     const response = await api(request, env, url);
     if (
       edgeCache &&
-      response.ok &&
+      (response.ok || [301, 302, 307, 308].includes(response.status)) &&
       /public/i.test(response.headers.get("cache-control") || "")
     ) {
       const write = edgeCache.put(request, response.clone());
