@@ -3301,12 +3301,134 @@ function Planner({
       }
       setPlanning(true);
       setRouteError("");
+      const segmentKey = (
+        mode: TravelMode,
+        point: Place | Spot,
+        destination: Place | Spot,
+      ) => `${mode}:${point.location}>${destination.location}`;
+      const routePointsForDay = (
+        group: Spot[],
+        endpoint: { origin: Place | Spot; destination: Place | Spot },
+      ): (Place | Spot)[] =>
+        [endpoint.origin, ...group, endpoint.destination].filter(
+          (point, index, all) =>
+            index === 0 || !samePlace(point, all[index - 1]),
+        );
+      const batchAttempted = new Set<string>();
+      const batchFailures = new Map<string, string>();
+      const primeRouteBatch = async () => {
+        const unique = new Map<
+          string,
+          {
+            id: string;
+            origin: string;
+            destination: string;
+            mode: TravelMode;
+          }
+        >();
+        for (const mode of TRAVEL_MODES) {
+          for (let dayIndex = 0; dayIndex < groups.length; dayIndex += 1) {
+            const points = routePointsForDay(
+              groups[dayIndex],
+              plannedEndpoints[dayIndex],
+            );
+            for (let index = 0; index < points.length - 1; index += 1) {
+              const key = segmentKey(mode, points[index], points[index + 1]);
+              if (routeCache.current.has(key) || unique.has(key)) continue;
+              unique.set(key, {
+                id: key,
+                origin: points[index].location,
+                destination: points[index + 1].location,
+                mode,
+              });
+            }
+          }
+        }
+        const pending = [...unique.values()];
+        if (!pending.length) return;
+        pending.forEach((item) => batchAttempted.add(item.id));
+        for (let offset = 0; offset < pending.length; offset += 21) {
+          const chunk = pending.slice(offset, offset + 21);
+          let chunkError = "批量路线请求失败";
+          let completed = false;
+          for (let attempt = 0; attempt < 2 && !completed; attempt += 1) {
+            const batchController = new AbortController();
+            const abortBatch = () => batchController.abort();
+            controller.signal.addEventListener("abort", abortBatch, {
+              once: true,
+            });
+            const batchTimeout = window.setTimeout(abortBatch, 60000);
+            try {
+              const response = await fetch(sameOriginUrl("/api/route-batch"), {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ city: city.routeCity, items: chunk }),
+                signal: batchController.signal,
+              });
+              const raw = await response.text();
+              let data: any = {};
+              try {
+                data = raw ? JSON.parse(raw) : {};
+              } catch {
+                // Cloudflare 偶发纯文本错误由整批重试处理。
+              }
+              if (!response.ok || !Array.isArray(data.results)) {
+                throw new Error(
+                  String(data.error || `批量路线请求失败 (${response.status})`),
+                );
+              }
+              const returned = new Set<string>();
+              for (const result of data.results) {
+                const key = String(result?.id || "");
+                if (!key || !batchAttempted.has(key)) continue;
+                returned.add(key);
+                if (
+                  result.ok &&
+                  (result.data?.stationary ||
+                    (Array.isArray(result.data?.polyline) &&
+                      result.data.polyline.length >= 2))
+                ) {
+                  routeCache.current.set(key, result.data as RouteSegment);
+                  batchFailures.delete(key);
+                } else {
+                  batchFailures.set(
+                    key,
+                    String(result.error || "高德未返回真实路线"),
+                  );
+                }
+              }
+              for (const item of chunk) {
+                if (!returned.has(item.id))
+                  batchFailures.set(item.id, "批量路线未返回该路段");
+              }
+              completed = true;
+            } catch (reason) {
+              if (controller.signal.aborted) throw reason;
+              chunkError =
+                batchController.signal.aborted
+                  ? "批量路线请求超时"
+                  : reason instanceof Error
+                    ? reason.message
+                    : "批量路线请求失败";
+              if (attempt === 0)
+                await new Promise((resolve) =>
+                  window.setTimeout(resolve, 600),
+                );
+            } finally {
+              window.clearTimeout(batchTimeout);
+              controller.signal.removeEventListener("abort", abortBatch);
+            }
+          }
+          if (!completed)
+            chunk.forEach((item) => batchFailures.set(item.id, chunkError));
+        }
+      };
       const fetchSegment = async (
         mode: TravelMode,
         point: Place | Spot,
         destination: Place | Spot,
       ): Promise<{ segment: RouteSegment; fetched: boolean }> => {
-        const key = `${mode}:${point.location}>${destination.location}`;
+        const key = segmentKey(mode, point, destination);
         const cached = routeCache.current.get(key);
         if (cached)
           return {
@@ -3317,6 +3439,8 @@ function Planner({
             },
             fetched: false,
           };
+        if (batchAttempted.has(key))
+          throw new Error(batchFailures.get(key) || "批量路线未返回数据");
         let lastReason = new Error("路线服务网络波动");
         for (let attempt = 0; attempt < 4; attempt += 1) {
           const segmentController = new AbortController();
@@ -3388,14 +3512,7 @@ function Planner({
         for (let dayIndex = 0; dayIndex < groups.length; dayIndex++) {
           const group = groups[dayIndex];
           const endpoint = plannedEndpoints[dayIndex];
-          const points: (Place | Spot)[] = [
-            endpoint.origin,
-            ...group,
-            endpoint.destination,
-          ].filter(
-            (point, index, all) =>
-              index === 0 || !samePlace(point, all[index - 1]),
-          );
+          const points = routePointsForDay(group, endpoint);
           const segments: RouteSegment[] = [];
           if (
             !(
@@ -3471,6 +3588,8 @@ function Planner({
         walking: emptyRoutes(days, plannedEndpoints),
       };
       setRoutesByMode(nextRoutes);
+      await primeRouteBatch();
+      if (controller.signal.aborted) return;
       const results = await Promise.all(
         TRAVEL_MODES.map(async (mode) => {
           const result = await buildMode(mode);

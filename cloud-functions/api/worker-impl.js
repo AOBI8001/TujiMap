@@ -474,6 +474,84 @@ async function api(request, env, url) {
       "x-tuji-cache": "miss",
     });
   }
+  if (url.pathname === "/api/route-batch") {
+    if (request.method !== "POST")
+      return json({ error: "批量路线接口仅支持 POST" }, 405);
+    let payload;
+    try {
+      payload = await request.json();
+    } catch {
+      return json({ error: "批量路线参数格式错误" }, 400);
+    }
+    const routeCity = String(payload?.city || "").slice(0, 20);
+    const coordinatePattern = /^-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?$/;
+    const items = (Array.isArray(payload?.items) ? payload.items : [])
+      .slice(0, 21)
+      .map((item, index) => ({
+        id: String(item?.id || index).slice(0, 240),
+        origin: String(item?.origin || ""),
+        destination: String(item?.destination || ""),
+        mode: ["driving", "transit", "walking"].includes(item?.mode)
+          ? item.mode
+          : "driving",
+      }))
+      .filter(
+        (item) =>
+          coordinatePattern.test(item.origin) &&
+          coordinatePattern.test(item.destination),
+      );
+    if (!items.length) return json({ error: "没有可规划的路线段" }, 400);
+
+    const results = Array(items.length);
+    let cursor = 0;
+    const processNext = async () => {
+      while (cursor < items.length) {
+        const index = cursor++;
+        const item = items[index];
+        let lastError = "路线服务网络波动，请重试";
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const target = new URL("/api/route", url.origin);
+          target.searchParams.set("origin", item.origin);
+          target.searchParams.set("destination", item.destination);
+          target.searchParams.set("mode", item.mode);
+          target.searchParams.set("city", routeCity);
+          const response = await api(
+            new Request(target.toString()),
+            env,
+            target,
+          );
+          const raw = await response.text();
+          let data = {};
+          try {
+            data = raw ? JSON.parse(raw) : {};
+          } catch {
+            // 统一在批量结果中返回可理解的错误，不把运行时纯文本暴露给前端。
+          }
+          if (
+            response.ok &&
+            (data.stationary ||
+              (Array.isArray(data.polyline) && data.polyline.length >= 2))
+          ) {
+            results[index] = { id: item.id, ok: true, data };
+            break;
+          }
+          lastError = String(data.error || "路线服务网络波动，请重试");
+          if (/距离超出|参数|不在当前城市/.test(lastError)) break;
+          if (attempt === 0) await sleep(500);
+        }
+        if (!results[index])
+          results[index] = { id: item.id, ok: false, error: lastError };
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(6, items.length) }, () => processNext()),
+    );
+    return json(
+      { results },
+      200,
+      { "cache-control": "no-store", "x-tuji-batch": "1" },
+    );
+  }
   if (url.pathname === "/api/route") {
     if (!env.AMAP_WEB_SERVICE_KEY)
       return json({ error: "尚未配置高德 Web服务 Key" }, 503);
