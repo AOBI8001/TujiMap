@@ -116,15 +116,29 @@ async function resolveAttractionImage(source: string) {
   if (!source.startsWith("/api/amap-photo?city=")) return source;
   const cached = attractionImageResolvedSources.get(source);
   if (cached) return cached;
-  const response = await fetch(`${source}&format=json`, {
-    headers: { accept: "application/json" },
-  });
-  if (!response.ok) throw new Error("景点图片地址解析失败");
-  const data = await response.json();
-  const resolved = String(data?.url || "");
-  if (!resolved) throw new Error("景点暂无图片");
-  attractionImageResolvedSources.set(source, resolved);
-  return resolved;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 9000);
+    try {
+      const response = await fetch(`${source}&format=json`, {
+        headers: { accept: "application/json" },
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error("景点图片地址解析失败");
+      const data = await response.json();
+      const resolved = String(data?.url || "");
+      if (!resolved) throw new Error("景点暂无图片");
+      attractionImageResolvedSources.set(source, resolved);
+      return resolved;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) await wait(450 + attempt * 650);
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("景点图片地址解析失败");
 }
 
 function loadAttractionImageOnce(source: string, timeoutMs: number) {
