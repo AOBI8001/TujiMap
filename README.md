@@ -6,7 +6,7 @@
 
 _基于真实地图与可解释启发式算法的城市多日旅行路线规划工具。_
 
-[![Version](https://img.shields.io/badge/version-1.1.3-168766)](CHANGELOG.md) [![React](https://img.shields.io/badge/React-19-2868e8)](https://react.dev/) [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6)](https://www.typescriptlang.org/) [![License](https://img.shields.io/badge/license-MIT-17211e)](LICENSE)
+[![Version](https://img.shields.io/badge/version-1.1.4-168766)](CHANGELOG.md) [![React](https://img.shields.io/badge/React-19-2868e8)](https://react.dev/) [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6)](https://www.typescriptlang.org/) [![License](https://img.shields.io/badge/license-MIT-17211e)](LICENSE)
 
 **随心成行，按途索迹。** 途迹把“发现景点、筛选景点、安排天数、生成真实导航”整合到同一张地图中，帮助用户得到少折返、可理解、可继续编辑的城市游览方案。
 

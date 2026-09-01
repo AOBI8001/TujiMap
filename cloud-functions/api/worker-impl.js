@@ -164,6 +164,54 @@ function redirectAmapPhoto(source) {
   });
 }
 
+const needsPhotoProxy = (source) => {
+  try {
+    return new URL(source).hostname.toLowerCase() === "aos-comment.amap.com";
+  } catch {
+    return false;
+  }
+};
+
+async function proxyAmapPhoto(source) {
+  const location = normalizeAmapPhoto(source);
+  if (!location) return json({ error: "图片地址无效" }, 400);
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 9000);
+    try {
+      const response = await fetch(location, {
+        headers: {
+          accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+          referer: "https://www.amap.com/",
+          "user-agent": "Mozilla/5.0 TujiMap/1.1",
+        },
+        signal: controller.signal,
+        cf: { cacheEverything: true, cacheTtl: 2592000 },
+      });
+      if (!response.ok) throw new Error(`图片源返回 ${response.status}`);
+      return new Response(response.body, {
+        status: 200,
+        headers: {
+          "content-type": response.headers.get("content-type") || "image/jpeg",
+          "cache-control":
+            "public, max-age=604800, s-maxage=2592000, stale-while-revalidate=86400",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) await sleep(350);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  return json(
+    { error: lastError instanceof Error ? lastError.message : "景点图片加载失败" },
+    502,
+  );
+}
+
 const straightDistanceKm = (from, to) => {
   const [fromLng, fromLat] = String(from).split(",").map(Number);
   const [toLng, toLat] = String(to).split(",").map(Number);
@@ -199,6 +247,8 @@ const requestJson = async (target, options = {}) => {
 async function api(request, env, url) {
   if (url.pathname === "/api/amap-photo") {
     let source = String(url.searchParams.get("url") || "").slice(0, 1800);
+    if (source && url.searchParams.get("proxy") === "1")
+      return proxyAmapPhoto(source);
     let fallbackCity = "";
     let fallbackName = "";
     if (!source) {
@@ -289,9 +339,12 @@ async function api(request, env, url) {
       }
     }
     if (!photoUrl) return json({ error: "该景点暂无可用图片" }, 404);
+    const clientPhotoUrl = needsPhotoProxy(photoUrl)
+      ? `/api/amap-photo?url=${encodeURIComponent(photoUrl)}&proxy=1`
+      : photoUrl;
     if (url.searchParams.get("format") === "json")
       return json(
-        { url: photoUrl },
+        { url: clientPhotoUrl },
         200,
         {
           "cache-control":
