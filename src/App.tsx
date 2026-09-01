@@ -102,41 +102,82 @@ const placeQueryCache = new Map<
 const placeQueryInflight = new Map<string, Promise<any[]>>();
 const attractionImagePreloads = new Map<string, Promise<boolean>>();
 const attractionImageReadySources = new Set<string>();
+const attractionImageResolvedSources = new Map<string, string>();
 const preparedCityPromises = new Map<CityId, Promise<CityConfig>>();
 
-function preloadAttractionImage(source?: string) {
-  if (!source) return Promise.resolve(false);
-  const cached = attractionImagePreloads.get(source);
-  if (cached) return cached;
+const wait = (milliseconds: number) =>
+  new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 
-  const request = new Promise<boolean>((resolve) => {
+function displayedAttractionImage(source?: string) {
+  return source ? attractionImageResolvedSources.get(source) || source : "";
+}
+
+async function resolveAttractionImage(source: string) {
+  if (!source.startsWith("/api/amap-photo?city=")) return source;
+  const cached = attractionImageResolvedSources.get(source);
+  if (cached) return cached;
+  const response = await fetch(`${source}&format=json`, {
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) throw new Error("景点图片地址解析失败");
+  const data = await response.json();
+  const resolved = String(data?.url || "");
+  if (!resolved) throw new Error("景点暂无图片");
+  attractionImageResolvedSources.set(source, resolved);
+  return resolved;
+}
+
+function loadAttractionImageOnce(source: string, timeoutMs: number) {
+  return new Promise<boolean>((resolve) => {
     const image = new Image();
     image.decoding = "async";
     image.fetchPriority = "high";
+    image.referrerPolicy = "no-referrer";
     let settled = false;
     const finish = (ok: boolean) => {
       if (settled) return;
       settled = true;
       window.clearTimeout(timeout);
-      if (ok) attractionImageReadySources.add(source);
-      else {
-        attractionImageReadySources.delete(source);
-        attractionImagePreloads.delete(source);
-      }
       resolve(ok);
     };
-    const timeout = window.setTimeout(() => finish(false), 7000);
+    const timeout = window.setTimeout(() => finish(false), timeoutMs);
     image.onload = async () => {
       try {
         await image.decode?.();
       } catch {
-        // The decoded bitmap is an optimisation only; the HTTP cache is ready.
+        // 解码只是优化；浏览器 HTTP 缓存已可供卡片直接复用。
       }
       finish(true);
     };
     image.onerror = () => finish(false);
     image.src = source;
   });
+}
+
+function preloadAttractionImage(source?: string) {
+  if (!source) return Promise.resolve(false);
+  const cached = attractionImagePreloads.get(source);
+  if (cached) return cached;
+
+  const request = (async () => {
+    try {
+      const resolved = await resolveAttractionImage(source);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const loaded = await loadAttractionImageOnce(resolved, 10000);
+        if (loaded) {
+          attractionImageReadySources.add(source);
+          attractionImageReadySources.add(resolved);
+          return true;
+        }
+        if (attempt < 2) await wait(350 + attempt * 450);
+      }
+    } catch {
+      // 没有可用图片时保留景点首字占位，不阻塞卡片交互。
+    }
+    attractionImageReadySources.delete(source);
+    attractionImagePreloads.delete(source);
+    return false;
+  })();
 
   attractionImagePreloads.set(source, request);
   return request;
@@ -146,30 +187,21 @@ async function preloadAttractionImages(spots: Spot[]) {
   const sources = Array.from(
     new Set(spots.map((spot) => spot.photo).filter(Boolean) as string[]),
   );
-  const fallback = sources.filter((source) =>
-    source.startsWith("/api/amap-photo?city="),
-  );
-  const direct = sources.filter((source) => !fallback.includes(source));
   let cursor = 0;
-  const warmDirect = async () => {
-    while (cursor < direct.length) {
-      const source = direct[cursor++];
-      await preloadAttractionImage(source);
+  const warm = async () => {
+    while (cursor < sources.length) {
+      const source = sources[cursor++];
+      try {
+        await preloadAttractionImage(source);
+      } catch {
+        // 单张图片失败不影响其余卡片继续预加载。
+      }
     }
   };
+  // 高德免费版关键字搜索上限为 3 QPS；统一保持三路并行。直接图片和
+  // 按名称补图同时开始，不再先等完一组才处理另一组。
   await Promise.allSettled(
-    Array.from({ length: Math.min(6, direct.length) }, () => warmDirect()),
-  );
-  // 需要按名称查询的图片会消耗高德关键字搜索配额，保持低并发后台补齐。
-  let fallbackCursor = 0;
-  const warmFallback = async () => {
-    while (fallbackCursor < fallback.length) {
-      const source = fallback[fallbackCursor++];
-      await preloadAttractionImage(source);
-    }
-  };
-  await Promise.allSettled(
-    Array.from({ length: Math.min(2, fallback.length) }, () => warmFallback()),
+    Array.from({ length: Math.min(3, sources.length) }, () => warm()),
   );
 }
 
@@ -1695,12 +1727,16 @@ function SwipeCard({
   onAct: (preference: Preference) => void;
   onMinimize: () => void;
 }) {
+  const photoSource = displayedAttractionImage(spot?.photo);
   const [drag, setDrag] = useState({ x: 0, y: 0, active: false });
   const [leaving, setLeaving] = useState<"left" | "right" | null>(null);
   const [showGuide, setShowGuide] = useState(true);
   const [photoFailed, setPhotoFailed] = useState(false);
   const [photoLoaded, setPhotoLoaded] = useState(
-    () => !!spot?.photo && attractionImageReadySources.has(spot.photo),
+    () =>
+      !!photoSource &&
+      (attractionImageReadySources.has(spot?.photo || "") ||
+        attractionImageReadySources.has(photoSource)),
   );
   const startRef = useRef({ x: 0, y: 0 });
   useEffect(() => {
@@ -1712,9 +1748,11 @@ function SwipeCard({
     setLeaving(null);
     setPhotoFailed(false);
     setPhotoLoaded(
-      !!spot?.photo && attractionImageReadySources.has(spot.photo),
+      !!photoSource &&
+        (attractionImageReadySources.has(spot?.photo || "") ||
+          attractionImageReadySources.has(photoSource)),
     );
-  }, [spot?.id]);
+  }, [spot?.id, spot?.photo, photoSource]);
   const down = (event: React.PointerEvent) => {
     startRef.current = { x: event.clientX, y: event.clientY };
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -1782,22 +1820,24 @@ function SwipeCard({
           }}
         >
           <div
-            className={`swipe-art ${spot.photo && photoLoaded && !photoFailed ? "has-photo" : ""}`}
+            className={`swipe-art ${photoSource && photoLoaded && !photoFailed ? "has-photo" : ""}`}
           >
-            {spot.photo && !photoFailed && (
+            {photoSource && !photoFailed && (
               <img
                 className="spot-photo"
-                src={spot.photo}
+                src={photoSource}
                 alt=""
                 draggable={false}
+                referrerPolicy="no-referrer"
                 onLoad={() => {
-                  attractionImageReadySources.add(spot.photo!);
+                  if (spot.photo) attractionImageReadySources.add(spot.photo);
+                  attractionImageReadySources.add(photoSource);
                   setPhotoLoaded(true);
                 }}
                 onError={() => setPhotoFailed(true)}
               />
             )}
-            {(!spot.photo || !photoLoaded || photoFailed) && (
+            {(!photoSource || !photoLoaded || photoFailed) && (
               <span className="spot-letter">{spot.name.slice(0, 1)}</span>
             )}
             <div

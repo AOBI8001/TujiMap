@@ -251,8 +251,8 @@ async function api(request, env, url) {
         candidates[0];
       source = String(matched?.photos?.[0]?.url || "");
     }
-    let photo = redirectAmapPhoto(source);
-    if (!photo && fallbackName) {
+    let photoUrl = normalizeAmapPhoto(source);
+    if (!photoUrl && fallbackName) {
       const shorterName = fallbackName
         .replace(
           /(历史文化|历史|文化|传统|民俗|风貌|旅游)*(街区|名街|步行街|观景平台|景区|风景区)$/,
@@ -282,13 +282,23 @@ async function api(request, env, url) {
           const fallbackSource = fallbackData?.pois?.find(
             (poi) => poi.photos?.[0]?.url,
           )?.photos?.[0]?.url;
-          photo = redirectAmapPhoto(fallbackSource);
+          photoUrl = normalizeAmapPhoto(fallbackSource);
         } catch {
           // 继续使用无图占位，不影响卡片选择本身。
         }
       }
     }
-    return photo || json({ error: "该景点暂无可用图片" }, 404);
+    if (!photoUrl) return json({ error: "该景点暂无可用图片" }, 404);
+    if (url.searchParams.get("format") === "json")
+      return json(
+        { url: photoUrl },
+        200,
+        {
+          "cache-control":
+            "public, max-age=604800, s-maxage=2592000, stale-while-revalidate=86400",
+        },
+      );
+    return redirectAmapPhoto(photoUrl);
   }
   if (url.pathname === "/api/status")
     return json({
