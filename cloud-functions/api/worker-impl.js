@@ -138,6 +138,21 @@ const collectPolyline = (value) => {
 const isAmapPhotoHost = (hostname) =>
   /(^|\.)(amap\.com|autonavi\.com)$/i.test(String(hostname || ""));
 
+function preferredAmapPhoto(photos) {
+  return (Array.isArray(photos) ? photos : [])
+    .map((photo) => normalizeAmapPhoto(photo?.url))
+    .filter(Boolean)
+    .sort((a, b) => {
+      const score = (source) => {
+        const hostname = new URL(source).hostname.toLowerCase();
+        if (hostname === "store.is.autonavi.com") return 3;
+        if (hostname === "aos-cdn-image.amap.com") return 2;
+        return 1;
+      };
+      return score(b) - score(a);
+    })[0];
+}
+
 function normalizeAmapPhoto(source) {
   let parsed;
   try {
@@ -286,20 +301,26 @@ async function api(request, env, url) {
       const normalize = (value) =>
         String(value || "").replace(/[·\s()（）—_-]/g, "");
       const expected = normalize(name);
-      const candidates = (data.pois || []).filter(
-        (poi) => poi.photos?.[0]?.url,
+      const candidates = (data.pois || []).filter((poi) =>
+        preferredAmapPhoto(poi.photos),
       );
       const matched =
         candidates.find((poi) => normalize(poi.name) === expected) ||
-        candidates.find((poi) => {
-          const candidate = normalize(poi.name);
-          return (
-            Math.min(candidate.length, expected.length) >= 3 &&
-            (candidate.includes(expected) || expected.includes(candidate))
-          );
-        }) ||
+        candidates
+          .filter((poi) => {
+            const candidate = normalize(poi.name);
+            return (
+              Math.min(candidate.length, expected.length) >= 3 &&
+              (candidate.includes(expected) || expected.includes(candidate))
+            );
+          })
+          .sort(
+            (a, b) =>
+              Math.abs(normalize(a.name).length - expected.length) -
+              Math.abs(normalize(b.name).length - expected.length),
+          )[0] ||
         candidates[0];
-      source = String(matched?.photos?.[0]?.url || "");
+      source = preferredAmapPhoto(matched?.photos) || "";
     }
     let photoUrl = normalizeAmapPhoto(source);
     if (!photoUrl && fallbackName) {
@@ -329,9 +350,10 @@ async function api(request, env, url) {
               ),
             -10,
           );
-          const fallbackSource = fallbackData?.pois?.find(
-            (poi) => poi.photos?.[0]?.url,
-          )?.photos?.[0]?.url;
+          const fallbackSource = preferredAmapPhoto(
+            fallbackData?.pois?.find((poi) => preferredAmapPhoto(poi.photos))
+              ?.photos,
+          );
           photoUrl = normalizeAmapPhoto(fallbackSource);
         } catch {
           // 继续使用无图占位，不影响卡片选择本身。
@@ -439,7 +461,7 @@ async function api(request, env, url) {
         citycode: poi.citycode || city,
         type: poi.type,
         rating: poi.business?.rating || "",
-        photo: poi.photos?.[0]?.url || "",
+        photo: preferredAmapPhoto(poi.photos) || "",
         hot: Math.max(
           45,
           82 - index - ((Number(url.searchParams.get("page")) || 1) - 1) * 10,

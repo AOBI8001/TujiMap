@@ -121,7 +121,7 @@ async function resolveAttractionImage(source: string) {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 9000);
     try {
-      const response = await fetch(`${source}&format=json`, {
+      const response = await fetch(`${source}&format=json&photo=v2`, {
         headers: { accept: "application/json" },
         signal: controller.signal,
       });
@@ -239,7 +239,7 @@ async function searchServerPlaces(
     try {
       const response = await fetch(
         sameOriginUrl(
-          `/api/places?city=${encodeURIComponent(cityName)}&keywords=${encodeURIComponent(keyword)}&page=${page}`,
+          `/api/places?city=${encodeURIComponent(cityName)}&keywords=${encodeURIComponent(keyword)}&page=${page}&photo=v2`,
         ),
         { signal: controller.signal },
       );
