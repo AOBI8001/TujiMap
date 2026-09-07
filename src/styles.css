@@ -1236,6 +1236,68 @@ button {
     top: 55px;
   }
 }
+
+/* GitHub repository entry beside the Tuji brand */
+.brand-cluster {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.github-link {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #dce3de;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.76);
+  color: var(--ink);
+  text-decoration: none;
+  box-shadow: 0 4px 14px rgba(23, 33, 30, 0.07);
+  transition:
+    color 160ms ease,
+    border-color 160ms ease,
+    background-color 160ms ease,
+    transform 160ms ease;
+}
+
+.github-link svg {
+  width: 21px;
+  height: 21px;
+  display: block;
+  fill: currentColor;
+}
+
+.github-link:hover {
+  color: #087f63;
+  border-color: #acd3c7;
+  background: #fff;
+  transform: translateY(-1px);
+}
+
+.github-link:focus-visible {
+  outline: 3px solid rgba(0, 155, 114, 0.24);
+  outline-offset: 2px;
+}
+
+@media (max-width: 760px) {
+  .brand-cluster {
+    gap: 7px;
+  }
+
+  .github-link {
+    width: 31px;
+    height: 31px;
+    flex-basis: 31px;
+  }
+
+  .github-link svg {
+    width: 19px;
+    height: 19px;
+  }
+}
 @media (max-width: 390px) {
   .setup-copy {
     margin-top: 7vh;
