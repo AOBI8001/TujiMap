@@ -39,6 +39,7 @@ type RouteSegment = {
   source: string;
   fromName: string;
   toName: string;
+  toId?: string;
 };
 type Endpoint = { origin: Place; destination: Place };
 type DayRoute = {
@@ -46,6 +47,7 @@ type DayRoute = {
   color: string;
   spots: Spot[];
   segments: RouteSegment[];
+  expectedSegments?: number;
   distance: number;
   duration: number;
   origin: Place;
@@ -95,21 +97,23 @@ const CITY_GROUPS = Object.entries(
       ] as const,
   );
 let amapLoader: Promise<any> | null = null;
-const placeQueryCache = new Map<
-  string,
-  { expires: number; pois: any[] }
->();
+const placeQueryCache = new Map<string, { expires: number; pois: any[] }>();
 const placeQueryInflight = new Map<string, Promise<any[]>>();
 const attractionImagePreloads = new Map<string, Promise<boolean>>();
 const attractionImageReadySources = new Set<string>();
 const attractionImageResolvedSources = new Map<string, string>();
+const attractionImageFailedUntil = new Map<string, number>();
 const preparedCityPromises = new Map<CityId, Promise<CityConfig>>();
 
 const wait = (milliseconds: number) =>
   new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 
 function displayedAttractionImage(source?: string) {
-  return source ? attractionImageResolvedSources.get(source) || source : "";
+  if (!source) return "";
+  return (
+    attractionImageResolvedSources.get(source) ||
+    (source.startsWith("/api/amap-photo?city=") ? "" : source)
+  );
 }
 
 async function resolveAttractionImage(source: string) {
@@ -117,14 +121,18 @@ async function resolveAttractionImage(source: string) {
   const cached = attractionImageResolvedSources.get(source);
   if (cached) return cached;
   let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 9000);
+    const timeout = window.setTimeout(() => controller.abort(), 15000);
     try {
       const response = await fetch(`${source}&format=json&photo=v2`, {
         headers: { accept: "application/json" },
         signal: controller.signal,
       });
+      if ([400, 401, 403, 404].includes(response.status)) {
+        attractionImageFailedUntil.set(source, Date.now() + 10 * 60 * 1000);
+        throw new Error("景点暂无图片");
+      }
       if (!response.ok) throw new Error("景点图片地址解析失败");
       const data = await response.json();
       const resolved = String(data?.url || "");
@@ -133,25 +141,31 @@ async function resolveAttractionImage(source: string) {
       return resolved;
     } catch (error) {
       lastError = error;
-      if (attempt < 2) await wait(450 + attempt * 650);
+      if ((attractionImageFailedUntil.get(source) || 0) > Date.now()) break;
+      if (attempt < 1) await wait(700);
     } finally {
       window.clearTimeout(timeout);
     }
   }
-  throw lastError instanceof Error ? lastError : new Error("景点图片地址解析失败");
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("景点图片地址解析失败");
 }
 
 function loadAttractionImageOnce(source: string, timeoutMs: number) {
   return new Promise<boolean>((resolve) => {
     const image = new Image();
     image.decoding = "async";
-    image.fetchPriority = "high";
+    image.fetchPriority = "low";
     image.referrerPolicy = "no-referrer";
     let settled = false;
     const finish = (ok: boolean) => {
       if (settled) return;
       settled = true;
       window.clearTimeout(timeout);
+      image.onload = null;
+      image.onerror = null;
+      if (!ok) image.src = "";
       resolve(ok);
     };
     const timeout = window.setTimeout(() => finish(false), timeoutMs);
@@ -170,26 +184,31 @@ function loadAttractionImageOnce(source: string, timeoutMs: number) {
 
 function preloadAttractionImage(source?: string) {
   if (!source) return Promise.resolve(false);
+  if ((attractionImageFailedUntil.get(source) || 0) > Date.now())
+    return Promise.resolve(false);
   const cached = attractionImagePreloads.get(source);
   if (cached) return cached;
 
   const request = (async () => {
     try {
       const resolved = await resolveAttractionImage(source);
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        const loaded = await loadAttractionImageOnce(resolved, 10000);
+      for (let attempt = 0; attempt < 1; attempt += 1) {
+        const loaded = await loadAttractionImageOnce(resolved, 8000);
         if (loaded) {
           attractionImageReadySources.add(source);
           attractionImageReadySources.add(resolved);
           return true;
         }
-        if (attempt < 2) await wait(350 + attempt * 450);
       }
     } catch {
       // 没有可用图片时保留景点首字占位，不阻塞卡片交互。
     }
     attractionImageReadySources.delete(source);
     attractionImagePreloads.delete(source);
+    attractionImageFailedUntil.set(
+      source,
+      Math.max(attractionImageFailedUntil.get(source) || 0, Date.now() + 60000),
+    );
     return false;
   })();
 
@@ -212,10 +231,10 @@ async function preloadAttractionImages(spots: Spot[]) {
       }
     }
   };
-  // 高德免费版关键字搜索上限为 3 QPS；统一保持三路并行。直接图片和
-  // 按名称补图同时开始，不再先等完一组才处理另一组。
+  // Download concurrency is independent of AMap QPS (enforced by the gateway).
+  // Slow CDN downloads no longer occupy all three lookup/preload lanes.
   await Promise.allSettled(
-    Array.from({ length: Math.min(3, sources.length) }, () => warm()),
+    Array.from({ length: Math.min(6, sources.length) }, () => warm()),
   );
 }
 
@@ -235,7 +254,7 @@ async function searchServerPlaces(
   if (inflight) return inflight;
   const request = (async () => {
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 4800);
+    const timeout = window.setTimeout(() => controller.abort(), 8500);
     try {
       const response = await fetch(
         sameOriginUrl(
@@ -270,18 +289,8 @@ async function searchServerPlaces(
   }
 }
 
-async function searchPlaces(
-  cityName: string,
-  keyword: string,
-  pageSize = 10,
-) {
-  try {
-    return (await searchServerPlaces(cityName, keyword, 1)).slice(0, pageSize);
-  } catch (error) {
-    if ((window as any).AMap)
-      return searchAmapPlaces(cityName, keyword, pageSize);
-    throw error;
-  }
+async function searchPlaces(cityName: string, keyword: string, pageSize = 10) {
+  return (await searchServerPlaces(cityName, keyword, 1)).slice(0, pageSize);
 }
 
 function loadAmap() {
@@ -584,8 +593,14 @@ function distanceKm(a: string, b: string) {
 function attractionStem(name: string) {
   return name
     .replace(/[\s·—_()（）【】\[\]，,。.-]/g, "")
-    .replace(/(景区|风景区|旅游区|文化旅游区|遗址公园|森林公园|湿地公园|公园|博物馆|纪念馆|艺术馆|展览馆|度假区|游览区)$/g, "")
-    .replace(/(东门|西门|南门|北门|正门|侧门|入口|出口|游客中心|停车场|码头)$/g, "");
+    .replace(
+      /(景区|风景区|旅游区|文化旅游区|遗址公园|森林公园|湿地公园|公园|博物馆|纪念馆|艺术馆|展览馆|度假区|游览区)$/g,
+      "",
+    )
+    .replace(
+      /(东门|西门|南门|北门|正门|侧门|入口|出口|游客中心|停车场|码头)$/g,
+      "",
+    );
 }
 
 function sameAttraction(a: Spot, b: Spot) {
@@ -623,13 +638,16 @@ function sameAttraction(a: Spot, b: Spot) {
   );
   if (distance < 0.38 && sharedPairs.length >= 1) return true;
   const gateOrBranch = /(门|入口|出口|游客中心|码头|分馆|园区)/;
-  return distance < 3 && gateOrBranch.test(a.name + b.name) && sharedPairs.length >= 1;
+  return (
+    distance < 3 &&
+    gateOrBranch.test(a.name + b.name) &&
+    sharedPairs.length >= 1
+  );
 }
 
 function selectCardSpots(items: Spot[]) {
   const ranked = [...items].sort(
-    (a, b) =>
-      b.hot - a.hot || Number(b.rating || 0) - Number(a.rating || 0),
+    (a, b) => b.hot - a.hot || Number(b.rating || 0) - Number(a.rating || 0),
   );
   const unique: Spot[] = [];
   for (const spot of ranked) {
@@ -801,6 +819,7 @@ function groupByDay(
   days: number,
   endpoints: Endpoint[],
   locks: Record<string, number>,
+  openRoute = false,
 ) {
   const count = Math.max(1, days);
   const groups: Spot[][] = Array.from({ length: count }, () => []);
@@ -812,7 +831,15 @@ function groupByDay(
     if (locked && locked <= count) groups[locked - 1].push(item);
   }
   if (unlocked.length) {
-    const target = Math.max(1, Math.ceil(items.length / count));
+    const capacity = groups.map((group) => group.length);
+    for (let left = 0; left < unlocked.length; left++) {
+      const smallest = Math.min(...capacity);
+      capacity[capacity.indexOf(smallest)]++;
+    }
+    const targetHours = Math.max(
+      1,
+      items.reduce((sum, spot) => sum + spot.duration, 0) / count,
+    );
     const remaining = [...unlocked];
     const centroid = (day: number) => {
       const points = groups[day].map((item) => coords(item.location));
@@ -826,7 +853,7 @@ function groupByDay(
       };
     };
     const seedDay = (day: number) => {
-      if (groups[day].length || !remaining.length) return;
+      if (groups[day].length || !remaining.length || !capacity[day]) return;
       let best = 0;
       if (day === 0) {
         for (let index = 1; index < remaining.length; index++) {
@@ -864,16 +891,24 @@ function groupByDay(
       let bestScore = Infinity;
       for (let pointIndex = 0; pointIndex < remaining.length; pointIndex++)
         for (let day = 0; day < count; day++) {
+          if (groups[day].length >= capacity[day]) continue;
           const center = centroid(day);
-          const loadPenalty =
-            1 +
-            Math.max(0, groups[day].length - target + 1) * 1.8 +
-            (groups[day].length / target) * 0.2;
+          const hours = groups[day].reduce(
+            (sum, spot) => sum + spot.duration,
+            0,
+          );
+          const loadPenalty = 1 + (hours / targetHours) * 0.2;
           const score =
             distanceKm(
               remaining[pointIndex].location,
               `${center.lng},${center.lat}`,
-            ) * loadPenalty;
+            ) *
+              loadPenalty +
+            Math.max(
+              0,
+              (hours + remaining[pointIndex].duration) / targetHours - 1,
+            ) *
+              2;
           if (score < bestScore) {
             bestScore = score;
             bestPoint = pointIndex;
@@ -882,9 +917,55 @@ function groupByDay(
         }
       groups[bestDay].push(remaining.splice(bestPoint, 1)[0]);
     }
+    // Bounded pair exchanges preserve day capacities and explicit user locks.
+    // Score includes spatial compactness and visit-time imbalance (not a claim
+    // that straight-line distance predicts actual travel time).
+    const groupCost = (group: Spot[]) => {
+      if (!group.length) return 0;
+      const positions = group.map((spot) => coords(spot.location));
+      const center = `${positions.reduce((sum, point) => sum + point.lng, 0) / group.length},${positions.reduce((sum, point) => sum + point.lat, 0) / group.length}`;
+      const hours = group.reduce((sum, spot) => sum + spot.duration, 0);
+      return (
+        group.reduce(
+          (sum, spot) => sum + distanceKm(spot.location, center),
+          0,
+        ) +
+        2 * (hours - targetHours) ** 2
+      );
+    };
+    for (let pass = 0; pass < 4 && count > 1; pass++) {
+      let best: [number, number, number, number] | null = null;
+      let improvement = 0.001;
+      const costs = groups.map(groupCost);
+      for (let a = 0; a < count; a++)
+        for (let b = a + 1; b < count; b++)
+          for (let i = 0; i < groups[a].length; i++)
+            for (let j = 0; j < groups[b].length; j++) {
+              if (
+                (locks[groups[a][i].id] >= 1 &&
+                  locks[groups[a][i].id] <= count) ||
+                (locks[groups[b][j].id] >= 1 && locks[groups[b][j].id] <= count)
+              )
+                continue;
+              const left = [...groups[a]],
+                right = [...groups[b]];
+              [left[i], right[j]] = [right[j], left[i]];
+              const gain =
+                costs[a] + costs[b] - groupCost(left) - groupCost(right);
+              if (gain > improvement) {
+                improvement = gain;
+                best = [a, b, i, j];
+              }
+            }
+      if (!best) break;
+      const [a, b, i, j] = best;
+      [groups[a][i], groups[b][j]] = [groups[b][j], groups[a][i]];
+    }
   }
   return groups.map((group, day) =>
-    orderStops(group, endpoints[day].origin, endpoints[day].destination),
+    openRoute
+      ? orderOpenStops(group)
+      : orderStops(group, endpoints[day].origin, endpoints[day].destination),
   );
 }
 
@@ -957,27 +1038,40 @@ function PlaceField({
 }) {
   const [text, setText] = useState(value?.name || "");
   const [results, setResults] = useState<Place[]>([]);
+  const [searchStatus, setSearchStatus] = useState("");
   const [open, setOpen] = useState(false);
   useEffect(() => setText(value?.name || ""), [value?.location, value?.name]);
   useEffect(() => {
-    if (!open || text.trim().length < 2 || text === value?.name) return;
+    if (!open || text.trim().length < 2 || text === value?.name) {
+      setSearchStatus("");
+      setResults([]);
+      return;
+    }
+    setResults([]);
+    setSearchStatus("正在搜索附近地点…");
     let cancelled = false;
     const timer = window.setTimeout(async () => {
       try {
         const pois = await searchPlaces(cityName, text, 7);
-        if (!cancelled) setResults(
-          pois
-            .map((poi) => ({
-              id: poi.id,
-              name: poi.name,
-              location: poiLocation(poi),
-              address: typeof poi.address === "string" ? poi.address : "",
-              area: poi.adname || poi.district || cityName,
-            }))
-            .filter((place) => place.location),
-        );
+        if (!cancelled)
+          setSearchStatus(pois.length ? "" : "没有匹配地点，请换一个关键词");
+        if (!cancelled)
+          setResults(
+            pois
+              .map((poi) => ({
+                id: poi.id,
+                name: poi.name,
+                location: poiLocation(poi),
+                address: typeof poi.address === "string" ? poi.address : "",
+                area: poi.adname || poi.district || cityName,
+              }))
+              .filter((place) => place.location),
+          );
       } catch {
-        if (!cancelled) setResults([]);
+        if (!cancelled) {
+          setResults([]);
+          setSearchStatus("搜索暂时无法完成，请稍后重试或更换关键词");
+        }
       }
     }, 260);
     return () => {
@@ -1003,6 +1097,11 @@ function PlaceField({
         }}
         placeholder={placeholder}
       />
+      {open && searchStatus && (
+        <div className="place-results search-status" role="status">
+          {searchStatus}
+        </div>
+      )}
       {open && results.length > 0 && (
         <div className="place-results">
           {results.map((item, index) => (
@@ -1760,6 +1859,16 @@ function SwipeCard({
   onAct: (preference: Preference) => void;
   onMinimize: () => void;
 }) {
+  const [, refreshPhoto] = useState(0);
+  useEffect(() => {
+    let canceled = false;
+    void preloadAttractionImage(spot?.photo).then(() => {
+      if (!canceled) refreshPhoto((value) => value + 1);
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [spot?.photo]);
   const photoSource = displayedAttractionImage(spot?.photo);
   const [drag, setDrag] = useState({ x: 0, y: 0, active: false });
   const [leaving, setLeaving] = useState<"left" | "right" | null>(null);
@@ -1954,6 +2063,7 @@ function MapCanvas({
 }) {
   const host = useRef<HTMLDivElement>(null);
   const mapRef = useRef<any>(undefined);
+  const fittedRouteView = useRef("");
   const amapRef = useRef<any>(undefined);
   const markerRecords = useRef(new Map<string, MarkerRecord>());
   const routeOverlays = useRef<any[]>([]);
@@ -2038,7 +2148,7 @@ function MapCanvas({
   useEffect(() => {
     if (!mapReady || city.spots.length >= city.mapTarget) return;
     let cancelled = false;
-    searchAmapPlaces(city.name, "景点", 50)
+    searchServerPlaces(city.name, "景点", 1)
       .then((pois) => {
         if (cancelled) return;
         const existingNames = new Set(
@@ -2318,7 +2428,12 @@ function MapCanvas({
       }
     }
     const routed = [...routeOverlays.current, ...endpointOverlays.current];
-    if (routed.length > endpointOverlays.current.length) {
+    const viewKey = `${endpointKey}:${activeDay}:${overviewOpen}:${routes.map((route) => route.spots.map((spot) => spot.id).join(",")).join("|")}`;
+    if (
+      routed.length > endpointOverlays.current.length &&
+      fittedRouteView.current !== viewKey
+    ) {
+      fittedRouteView.current = viewKey;
       if (window.matchMedia("(max-width:760px)").matches) {
         const activeRoute = routes[activeDay];
         setMobileMapView(
@@ -2330,16 +2445,15 @@ function MapCanvas({
           ].filter(Boolean) as string[],
           city.center,
         );
-      } else map.setFitView(routed, false, [90, 75, 235, 390], 16);
+      } else {
+        // Include all planned stops on the first batch, so later batches don't
+        // need to zoom repeatedly or leave the remaining days outside the view.
+        const plannedMarkers = routes.flatMap(route => route.spots)
+          .map(spot => markerRecords.current.get(spot.id)?.marker).filter(Boolean);
+        map.setFitView([...routed, ...plannedMarkers], false, [90, 75, 235, 390], 16);
+      }
     }
-  }, [
-    mapReady,
-    routeKey,
-    endpointKey,
-    activeDay,
-    overviewOpen,
-    city.center,
-  ]);
+  }, [mapReady, routeKey, endpointKey, activeDay, overviewOpen, city.center]);
   return (
     <div className="map-wrap">
       <div ref={host} className="real-map" />
@@ -2466,6 +2580,7 @@ function RouteDock({
   endpoint,
   onEndpoint,
   planning,
+  planningProgress,
   mode,
   onMode,
   onRemove,
@@ -2488,6 +2603,7 @@ function RouteDock({
   endpoint: Endpoint;
   onEndpoint: (endpoint: Endpoint) => void;
   planning: boolean;
+  planningProgress: string;
   mode: TravelMode;
   onMode: (mode: TravelMode) => void;
   onRemove: (spot: Spot) => void;
@@ -2529,12 +2645,16 @@ function RouteDock({
             {route.duration
               ? `约 ${minutes(route.duration)} 分钟`
               : selectedCount
-                ? `${selectedCount} 个已选地点`
+                ? `${route.spots.length || selectedCount} 个地点`
                 : "等待选择地点"}
           </h2>
         </div>
         <div className="dock-status">
-          {planning && <span className="planning-dot">正在计算三种路线</span>}
+          {planning && (
+            <span className="planning-dot" role="status">
+              {planningProgress || "正在计算三种路线"}
+            </span>
+          )}
           <button
             className="dock-minimize"
             onClick={onMinimize}
@@ -2544,10 +2664,26 @@ function RouteDock({
           </button>
         </div>
       </div>
+      {route.spots.length > 0 && (
+        <p className="day-load-hint">
+          本日 {route.spots.length} 个景点 · 预计游玩{" "}
+          {route.spots.reduce((sum, spot) => sum + spot.duration, 0).toFixed(1)}{" "}
+          小时
+          {route.spots.reduce((sum, spot) => sum + spot.duration, 0) +
+            route.duration / 3600 >
+            10 && (
+            <strong>
+              行程偏满，建议增加天数或减少景点；交通和休息还需额外时间。
+            </strong>
+          )}
+        </p>
+      )}
       <div className="day-switch-block">
         <div className="day-switch-heading">
           <span>第几天</span>
-          <small>{overviewOpen ? "全部路线" : `仅第 ${activeDay + 1} 天`}</small>
+          <small>
+            {overviewOpen ? "全部路线" : `仅第 ${activeDay + 1} 天`}
+          </small>
         </div>
         <div className="day-switch">
           <div className="day-buttons">
@@ -2601,127 +2737,146 @@ function RouteDock({
         ))}
       </div>
       <div className="route-list detailed">
+        {!planning && (route.expectedSegments || 0) > route.segments.length && (
+          <p className="day-load-hint">
+            本日仍有 {(route.expectedSegments || 0) - route.segments.length}{" "}
+            段未完成；当前显示部分交通耗时，可再次点击“选好了”仅重试缺失路段。
+          </p>
+        )}
         {route.segments.length ? (
-          route.segments.map((segment, index) => (
-            <section
-              className="segment-card"
-              key={`${segment.fromName}-${segment.toName}-${index}`}
-            >
-              <header>
-                <div>
-                  <b>{segment.fromName}</b>
-                  <span>→</span>
-                  <b>{segment.toName}</b>
+          route.segments.map((segment, index) => {
+            const stop = route.spots.find((spot) => spot.id === segment.toId);
+            return (
+              <section
+                className="segment-card"
+                key={`${segment.fromName}-${segment.toName}-${index}`}
+              >
+                <header>
+                  <div>
+                    <b>{segment.fromName}</b>
+                    <span>→</span>
+                    <b>{segment.toName}</b>
+                  </div>
+                  <strong>
+                    {minutes(segment.duration)} 分钟 ·{" "}
+                    {distanceLabel(segment.distance)}
+                  </strong>
+                </header>
+                <div className="nav-details">
+                  {segment.details.map((detail, detailIndex) => (
+                    <div
+                      className={`nav-step ${detail.kind}`}
+                      key={`${detail.title}-${detailIndex}`}
+                    >
+                      <i>
+                        {detail.kind === "drive" ? (
+                          <img src={sameOriginUrl("/drive-icon.png")} alt="" />
+                        ) : (
+                          <img
+                            src={sameOriginUrl(
+                              detail.kind === "walk"
+                                ? "/walk-icon.png"
+                                : "/transit-icon.png",
+                            )}
+                            alt=""
+                          />
+                        )}
+                      </i>
+                      <div>
+                        <b>{detail.title}</b>
+                        {detail.kind === "transit" ? (
+                          <span>
+                            {detail.from} 上车 · {detail.to} 下车
+                            {detail.via ? ` · 途经 ${detail.via} 站` : ""}
+                          </span>
+                        ) : (
+                          detail.instruction && (
+                            <span>{detail.instruction}</span>
+                          )
+                        )}
+                      </div>
+                      <small>
+                        {minutes(detail.duration)} 分钟
+                        <br />
+                        {distanceLabel(detail.distance)}
+                      </small>
+                    </div>
+                  ))}
                 </div>
-                <strong>
-                  {minutes(segment.duration)} 分钟 ·{" "}
-                  {distanceLabel(segment.distance)}
-                </strong>
-              </header>
-              <div className="nav-details">
-                {segment.details.map((detail, detailIndex) => (
-                  <div
-                    className={`nav-step ${detail.kind}`}
-                    key={`${detail.title}-${detailIndex}`}
-                  >
-                    <i>
-                      {detail.kind === "drive" ? (
-                        <img src={sameOriginUrl("/drive-icon.png")} alt="" />
-                      ) : (
-                        <img
-                          src={sameOriginUrl(
-                            detail.kind === "walk"
-                              ? "/walk-icon.png"
-                              : "/transit-icon.png",
-                          )}
-                          alt=""
-                        />
-                      )}
-                    </i>
-                    <div>
-                      <b>{detail.title}</b>
-                      {detail.kind === "transit" ? (
-                        <span>
-                          {detail.from} 上车 · {detail.to} 下车
-                          {detail.via ? ` · 途经 ${detail.via} 站` : ""}
-                        </span>
-                      ) : (
-                        detail.instruction && <span>{detail.instruction}</span>
-                      )}
-                    </div>
-                    <small>
-                      {minutes(detail.duration)} 分钟
-                      <br />
-                      {distanceLabel(detail.distance)}
-                    </small>
-                  </div>
-                ))}
-              </div>
-              {route.spots[index] && (
-                <>
-                  {(() => {
-                    const insertionKey = `${activeDay}-${route.spots[index].id}`;
-                    return (
-                      <>
-                  <div className="stop-edit-actions">
-                    <button
-                      aria-pressed={pendingRemovalIds.has(route.spots[index].id)}
-                      className={`remove-stop ${pendingRemovalIds.has(route.spots[index].id) ? "pending" : ""}`}
-                      onClick={() => onRemove(route.spots[index])}
-                    >
-                      {pendingRemovalIds.has(route.spots[index].id) ? (
+                {stop && (
+                  <>
+                    {(() => {
+                      const insertionKey = `${activeDay}-${stop!.id}`;
+                      return (
                         <>
-                          <b>✓ 已标记移除</b>
-                          <span>点击“完成编辑”生效</span>
+                          <div className="stop-edit-actions">
+                            <button
+                              aria-pressed={pendingRemovalIds.has(stop!.id)}
+                              className={`remove-stop ${pendingRemovalIds.has(stop!.id) ? "pending" : ""}`}
+                              onClick={() => onRemove(stop!)}
+                            >
+                              {pendingRemovalIds.has(stop!.id) ? (
+                                <>
+                                  <b>✓ 已标记移除</b>
+                                  <span>点击“完成编辑”生效</span>
+                                </>
+                              ) : (
+                                <>移除该地</>
+                              )}
+                            </button>
+                            <button
+                              className="insert-stop"
+                              onClick={() =>
+                                setInsertAfter((current) =>
+                                  current === index ? null : index,
+                                )
+                              }
+                            >
+                              新增地点
+                            </button>
+                          </div>
+                          {insertAfter === index && (
+                            <InsertStopEditor
+                              cityName={cityName}
+                              onCancel={() => setInsertAfter(null)}
+                              onSelect={(place) => {
+                                onInsert(activeDay, stop!, place);
+                                setPendingInsertions((current) => ({
+                                  ...current,
+                                  [insertionKey]: [
+                                    ...(current[insertionKey] || []),
+                                    place.name,
+                                  ],
+                                }));
+                                setInsertAfter(null);
+                              }}
+                            />
+                          )}
+                          {pendingInsertions[insertionKey]?.length > 0 && (
+                            <div className="pending-insert-label">
+                              <b>
+                                ✓ 已加入{" "}
+                                {pendingInsertions[insertionKey].join("、")}
+                              </b>
+                              <span>点击“完成编辑”生效</span>
+                            </div>
+                          )}
                         </>
-                      ) : (
-                        <>移除该地</>
-                      )}
-                    </button>
-                    <button
-                      className="insert-stop"
-                      onClick={() =>
-                        setInsertAfter((current) =>
-                          current === index ? null : index,
-                        )
-                      }
-                    >
-                      新增地点
-                    </button>
-                  </div>
-                  {insertAfter === index && (
-                    <InsertStopEditor
-                      cityName={cityName}
-                      onCancel={() => setInsertAfter(null)}
-                      onSelect={(place) => {
-                        onInsert(activeDay, route.spots[index], place);
-                        setPendingInsertions((current) => ({
-                          ...current,
-                          [insertionKey]: [
-                            ...(current[insertionKey] || []),
-                            place.name,
-                          ],
-                        }));
-                        setInsertAfter(null);
-                      }}
-                    />
-                  )}
-                  {pendingInsertions[insertionKey]?.length > 0 && (
-                    <div className="pending-insert-label">
-                      <b>✓ 已加入 {pendingInsertions[insertionKey].join("、")}</b>
-                      <span>点击“完成编辑”生效</span>
-                    </div>
-                  )}
-                      </>
-                    );
-                  })()}
-                </>
-              )}
-            </section>
-          ))
+                      );
+                    })()}
+                  </>
+                )}
+              </section>
+            );
+          })
         ) : (
           <div className="empty-route">
-            选择地点或编辑起终点后，点击“选好了”
+            {planning
+              ? "正在按路段生成，已完成部分会自动显示"
+              : route.spots.length === 1 &&
+                  samePlace(endpoint.origin, endpoint.destination)
+                ? "本日仅一个地点，无需生成地点间路线"
+                : "选择地点或编辑起终点后，点击“选好了”"}
           </div>
         )}
       </div>
@@ -2762,20 +2917,30 @@ function MapSearch({
   const [results, setResults] = useState<any[]>([]);
   const [focused, setFocused] = useState(false);
   const [typed, setTyped] = useState(false);
+  const [searchStatus, setSearchStatus] = useState("");
   useEffect(() => {
     if (!focused || !typed || text.trim().length < 2) {
       setResults([]);
+      setSearchStatus("");
       return;
     }
+    setResults([]);
+    setSearchStatus("正在搜索附近地点…");
     let cancelled = false;
     const timer = window.setTimeout(async () => {
       try {
         const pois = (await searchPlaces(cityName, text, 6)).filter((poi) =>
-            poiLocation(poi),
-          );
-        if (!cancelled) setResults(pois);
+          poiLocation(poi),
+        );
+        if (!cancelled) {
+          setResults(pois);
+          setSearchStatus(pois.length ? "" : "没有匹配地点，请换一个关键词");
+        }
       } catch {
-        if (!cancelled) setResults([]);
+        if (!cancelled) {
+          setResults([]);
+          setSearchStatus("搜索暂时无法完成，请稍后重试或更换关键词");
+        }
       }
     }, 260);
     return () => {
@@ -2824,6 +2989,11 @@ function MapSearch({
         }}
         placeholder={`添加更多景点，例如：${example}`}
       />
+      {focused && typed && searchStatus && (
+        <div className="map-search-results search-status" role="status">
+          {searchStatus}
+        </div>
+      )}
       {focused && typed && results.length > 0 && (
         <div className="map-search-results">
           {results.map((poi, index) => (
@@ -3048,10 +3218,7 @@ function Planner({
     () => [...city.spots, ...discoveredSpots, ...customSpots],
     [city.spots, discoveredSpots, customSpots],
   );
-  const cardSpots = useMemo(
-    () => selectCardSpots(city.spots),
-    [city.spots],
-  );
+  const cardSpots = useMemo(() => selectCardSpots(city.spots), [city.spots]);
   const initialEndpoints = useMemo(
     () => endpointsFromStays(days, stays, city),
     [days, stays, city],
@@ -3087,6 +3254,8 @@ function Planner({
     walking: emptyRoutes(days, initialEndpoints),
   });
   const [planning, setPlanning] = useState(false);
+  const [planningProgress, setPlanningProgress] = useState("");
+  const [planRevision, setPlanRevision] = useState(0);
   const [cardImagesReady, setCardImagesReady] = useState(false);
   const [activeDay, setActiveDay] = useState(0);
   const [activeSpot, setActiveSpot] = useState<Spot | null>(null);
@@ -3100,6 +3269,7 @@ function Planner({
   const [routeError, setRouteError] = useState("");
   const [textScale, setTextScale] = useState(1);
   const routeCache = useRef(new Map<string, RouteSegment>());
+  const routeCacheExpires = useRef(new Map<string, number>());
 
   // 城市选择后 App 已开始预取；地图页继续等待全部热门卡片图片完成解码，
   // 用户打开卡片后连续滑动不会再逐张等待网络。
@@ -3110,9 +3280,11 @@ function Planner({
     const timeLimit = new Promise<void>((resolve) => {
       deadline = window.setTimeout(resolve, 15000);
     });
-    void Promise.race([preloadAttractionImages(cardSpots), timeLimit]).then(() => {
-      if (!cancelled) setCardImagesReady(true);
-    });
+    void Promise.race([preloadAttractionImages(cardSpots), timeLimit]).then(
+      () => {
+        if (!cancelled) setCardImagesReady(true);
+      },
+    );
 
     return () => {
       cancelled = true;
@@ -3132,7 +3304,9 @@ function Planner({
         const fallback = initialEndpoints[index] || initialEndpoints.at(-1);
         if (!fallback) return endpoint;
         return {
-          origin: isTentative(endpoint.origin) ? fallback.origin : endpoint.origin,
+          origin: isTentative(endpoint.origin)
+            ? fallback.origin
+            : endpoint.origin,
           destination: isTentative(endpoint.destination)
             ? fallback.destination
             : endpoint.destination,
@@ -3163,12 +3337,15 @@ function Planner({
     nextLocks: Record<string, number>,
     aiResult?: AiResult,
   ) => {
+    setPlanRevision((revision) => revision + 1);
     const nextSelected = spots.filter(
       (spot) =>
         nextPreferences[spot.id] === "must" ||
         nextPreferences[spot.id] === "like",
     );
-    const requestedEndpoints = draftEndpoints.map((endpoint) => ({ ...endpoint }));
+    const requestedEndpoints = draftEndpoints.map((endpoint) => ({
+      ...endpoint,
+    }));
     const hasConfirmedStay = stays.some((stay) => Boolean(stay.place));
     const automaticOpenRoute = !hasConfirmedStay && !endpointsCustomized;
     let nextGroups = groupByDay(
@@ -3176,9 +3353,8 @@ function Planner({
       days,
       requestedEndpoints,
       nextLocks,
+      automaticOpenRoute,
     );
-    if (automaticOpenRoute)
-      nextGroups = nextGroups.map((group) => orderOpenStops(group));
     for (const instruction of aiResult?.spots || []) {
       if (
         instruction.preference !== "like" ||
@@ -3205,9 +3381,7 @@ function Planner({
         continue;
       const anchorId = group[anchorIndex].id;
       const [target] = group.splice(targetIndex, 1);
-      const nextAnchorIndex = group.findIndex(
-        (spot) => spot.id === anchorId,
-      );
+      const nextAnchorIndex = group.findIndex((spot) => spot.id === anchorId);
       const insertIndex =
         nextAnchorIndex >= 0
           ? nextAnchorIndex + 1
@@ -3245,7 +3419,9 @@ function Planner({
   };
   const commitPlan = () => commitPlanWith(preferences, dayLocks);
   const clearSelection = () => {
-    const resetEndpoints = initialEndpoints.map((endpoint) => ({ ...endpoint }));
+    const resetEndpoints = initialEndpoints.map((endpoint) => ({
+      ...endpoint,
+    }));
     setPreferences({});
     setCustomSpots([]);
     setPlannedIds([]);
@@ -3319,12 +3495,14 @@ function Planner({
         return;
       }
       setPlanning(true);
+      setPlanningProgress("正在准备路线");
       setRouteError("");
       const segmentKey = (
         mode: TravelMode,
         point: Place | Spot,
         destination: Place | Spot,
-      ) => `${mode}:${point.location}>${destination.location}`;
+      ) =>
+        `${city.routeCity}:${mode}:${point.location}>${destination.location}`;
       const routePointsForDay = (
         group: Spot[],
         endpoint: { origin: Place | Spot; destination: Place | Spot },
@@ -3333,324 +3511,171 @@ function Planner({
           (point, index, all) =>
             index === 0 || !samePlace(point, all[index - 1]),
         );
-      const batchAttempted = new Set<string>();
-      const batchFailures = new Map<string, string>();
-      const primeRouteBatch = async () => {
-        const unique = new Map<
-          string,
-          {
-            id: string;
-            origin: string;
-            destination: string;
-            mode: TravelMode;
-          }
-        >();
-        for (const mode of TRAVEL_MODES) {
-          for (let dayIndex = 0; dayIndex < groups.length; dayIndex += 1) {
-            const points = routePointsForDay(
-              groups[dayIndex],
-              plannedEndpoints[dayIndex],
-            );
-            for (let index = 0; index < points.length - 1; index += 1) {
-              const key = segmentKey(mode, points[index], points[index + 1]);
-              if (routeCache.current.has(key) || unique.has(key)) continue;
-              unique.set(key, {
-                id: key,
-                origin: points[index].location,
-                destination: points[index + 1].location,
-                mode,
-              });
-            }
-          }
-        }
-        const pending = [...unique.values()];
-        if (!pending.length) return;
-        pending.forEach((item) => batchAttempted.add(item.id));
-        for (let offset = 0; offset < pending.length; offset += 21) {
-          const chunk = pending.slice(offset, offset + 21);
-          let chunkError = "批量路线请求失败";
-          let completed = false;
-          for (let attempt = 0; attempt < 2 && !completed; attempt += 1) {
-            const batchController = new AbortController();
-            const abortBatch = () => batchController.abort();
-            controller.signal.addEventListener("abort", abortBatch, {
-              once: true,
+      const modes = TRAVEL_MODES;
+      const jobs = new Map<
+        string,
+        { id: string; origin: string; destination: string; mode: TravelMode }
+      >();
+      // Interleave services within each edge; don't fill a batch with only driving.
+      for (let day = 0; day < groups.length; day++) {
+        const points = routePointsForDay(groups[day], plannedEndpoints[day]);
+        for (let i = 0; i < points.length - 1; i++)
+          for (const mode of modes) {
+            const id = segmentKey(mode, points[i], points[i + 1]);
+            if ((routeCacheExpires.current.get(id) || 0) <= Date.now())
+              routeCache.current.delete(id);
+            jobs.set(id, {
+              id,
+              origin: points[i].location,
+              destination: points[i + 1].location,
+              mode,
             });
-            const batchTimeout = window.setTimeout(abortBatch, 60000);
-            try {
-              const response = await fetch(sameOriginUrl("/api/route-batch"), {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ city: city.routeCity, items: chunk }),
-                signal: batchController.signal,
-              });
-              const raw = await response.text();
-              let data: any = {};
-              try {
-                data = raw ? JSON.parse(raw) : {};
-              } catch {
-                // Cloudflare 偶发纯文本错误由整批重试处理。
-              }
-              if (!response.ok || !Array.isArray(data.results)) {
-                throw new Error(
-                  String(data.error || `批量路线请求失败 (${response.status})`),
-                );
-              }
-              const returned = new Set<string>();
-              for (const result of data.results) {
-                const key = String(result?.id || "");
-                if (!key || !batchAttempted.has(key)) continue;
-                returned.add(key);
-                if (
-                  result.ok &&
-                  (result.data?.stationary ||
-                    (Array.isArray(result.data?.polyline) &&
-                      result.data.polyline.length >= 2))
-                ) {
-                  routeCache.current.set(key, result.data as RouteSegment);
-                  batchFailures.delete(key);
-                } else {
-                  batchFailures.set(
-                    key,
-                    String(result.error || "高德未返回真实路线"),
-                  );
-                }
-              }
-              for (const item of chunk) {
-                if (!returned.has(item.id))
-                  batchFailures.set(item.id, "批量路线未返回该路段");
-              }
-              completed = true;
-            } catch (reason) {
-              if (controller.signal.aborted) throw reason;
-              chunkError =
-                batchController.signal.aborted
-                  ? "批量路线请求超时"
-                  : reason instanceof Error
-                    ? reason.message
-                    : "批量路线请求失败";
-              if (attempt === 0)
-                await new Promise((resolve) =>
-                  window.setTimeout(resolve, 600),
-                );
-            } finally {
-              window.clearTimeout(batchTimeout);
-              controller.signal.removeEventListener("abort", abortBatch);
-            }
           }
-          if (!completed)
-            chunk.forEach((item) => batchFailures.set(item.id, chunkError));
-        }
+      }
+      const failures = new Map<string, string>();
+      const pending = [...jobs.values()].filter(
+        (job) => !routeCache.current.has(job.id),
+      );
+      const publish = () => {
+        if (controller.signal.aborted) return;
+        const next = {} as Record<TravelMode, DayRoute[]>;
+        for (const mode of modes)
+          next[mode] = groups.map((group, day) => {
+            const endpoint = plannedEndpoints[day];
+            const points = routePointsForDay(group, endpoint);
+            const segments: RouteSegment[] = [];
+            for (let i = 0; i < points.length - 1; i++) {
+              const value = routeCache.current.get(
+                segmentKey(mode, points[i], points[i + 1]),
+              );
+              if (value)
+                segments.push({
+                  ...value,
+                  fromName: points[i].name,
+                  toName: points[i + 1].name,
+                  toId: points[i + 1].id,
+                });
+            }
+            return {
+              day: day + 1,
+              color: DAY_COLORS[day],
+              spots: group,
+              segments,
+              expectedSegments: Math.max(0, points.length - 1),
+              distance: segments.reduce((sum, part) => sum + part.distance, 0),
+              duration: segments.reduce((sum, part) => sum + part.duration, 0),
+              ...endpoint,
+            };
+          });
+        setRoutesByMode(next);
+        const ready = [...jobs.keys()].filter((key) =>
+          routeCache.current.has(key),
+        ).length;
+        setPlanningProgress(`已生成 ${ready}/${jobs.size} 段 · 三种方式`);
       };
-      const fetchSegment = async (
-        mode: TravelMode,
-        point: Place | Spot,
-        destination: Place | Spot,
-      ): Promise<{ segment: RouteSegment; fetched: boolean }> => {
-        const key = segmentKey(mode, point, destination);
-        const cached = routeCache.current.get(key);
-        if (cached)
-          return {
-            segment: {
-              ...cached,
-              fromName: point.name,
-              toName: destination.name,
-            },
-            fetched: false,
-          };
-        if (batchAttempted.has(key))
-          throw new Error(batchFailures.get(key) || "批量路线未返回数据");
-        let lastReason = new Error("路线服务网络波动");
-        for (let attempt = 0; attempt < 4; attempt += 1) {
-          const segmentController = new AbortController();
-          const abortSegment = () => segmentController.abort();
-          controller.signal.addEventListener("abort", abortSegment, {
+      publish();
+      performance.mark("tuji-route-request-start");
+      try {
+        // Small mixed batches bound tail latency and expose completed routes early.
+        for (let offset = 0; offset < pending.length; offset += 12) {
+          if (controller.signal.aborted) return;
+          const chunk = pending.slice(offset, offset + 12);
+          const batchController = new AbortController();
+          const abortBatch = () => batchController.abort();
+          controller.signal.addEventListener("abort", abortBatch, {
             once: true,
           });
-          const segmentTimeout = window.setTimeout(abortSegment, 12000);
+          const timeout = window.setTimeout(abortBatch, 35000);
           try {
-            const response = await fetch(
-              sameOriginUrl(
-                `/api/route?origin=${point.location}&destination=${destination.location}&mode=${mode}&city=${encodeURIComponent(city.routeCity)}`,
-              ),
-              { signal: segmentController.signal },
-            );
+            const response = await fetch(sameOriginUrl("/api/route-batch"), {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ city: city.routeCity, items: chunk }),
+              signal: batchController.signal,
+            });
             const raw = await response.text();
-            let data: any = {};
+            let data: any;
             try {
-              data = raw ? JSON.parse(raw) : {};
+              data = JSON.parse(raw);
             } catch {
-              // Cloudflare 运行时异常会返回纯文本 1101；下方按可重试错误处理。
+              throw new Error(`路线服务响应异常 (${response.status})`);
             }
-            if (
-              response.ok &&
-              (data.stationary ||
-                (Array.isArray(data.polyline) && data.polyline.length >= 2))
-            ) {
-              const segment = {
-                ...data,
-                fromName: point.name,
-                toName: destination.name,
-              } as RouteSegment;
-              routeCache.current.set(key, segment);
-              return { segment, fetched: true };
+            if (!response.ok || !Array.isArray(data.results))
+              throw new Error(
+                data.error || `路线请求失败 (${response.status})`,
+              );
+            if (controller.signal.aborted) return;
+            const remaining = new Set(chunk.map((job) => job.id));
+            for (const result of data.results) {
+              if (!remaining.delete(result.id)) continue;
+              if (
+                result.ok &&
+                (result.data?.stationary || result.data?.polyline?.length >= 2)
+              ) {
+                routeCache.current.set(result.id, result.data);
+                const mode = jobs.get(result.id)!.mode;
+                routeCacheExpires.current.set(
+                  result.id,
+                  Date.now() +
+                    (mode === "driving"
+                      ? 5 * 60
+                      : mode === "transit"
+                        ? 6 * 3600
+                        : 7 * 86400) *
+                      1000,
+                );
+              } else
+                failures.set(result.id, result.error || "高德未返回该路段");
             }
-            const message = String(
-              data.error ||
-                (response.status >= 500
-                  ? "路线服务网络波动"
-                  : "高德未返回真实路线"),
-            );
-            lastReason = new Error(message);
-            if (/距离超出|参数|不在当前城市/.test(message)) throw lastReason;
-          } catch (reason) {
-            if (controller.signal.aborted) throw reason;
-            lastReason = new Error(
-              segmentController.signal.aborted
-                ? "路线请求超时"
-                : reason instanceof Error
-                  ? reason.message
-                  : "路线服务网络波动",
-            );
-            if (/距离超出|参数|不在当前城市/.test(lastReason.message))
-              throw lastReason;
+            for (const id of remaining) failures.set(id, "批量响应缺少该路段");
+          } catch (error) {
+            if (controller.signal.aborted) return;
+            const message = batchController.signal.aborted
+              ? "路线请求超过 35 秒，请稍后重试"
+              : error instanceof Error
+                ? error.message
+                : "路线请求失败";
+            for (const job of chunk) failures.set(job.id, message);
           } finally {
-            window.clearTimeout(segmentTimeout);
-            controller.signal.removeEventListener("abort", abortSegment);
+            window.clearTimeout(timeout);
+            controller.signal.removeEventListener("abort", abortBatch);
           }
-          if (attempt < 3)
-            await new Promise((resolve) =>
-              window.setTimeout(resolve, 280 + attempt * 320),
-            );
+          publish();
         }
-        throw lastReason;
-      };
-      const buildMode = async (mode: TravelMode) => {
-        const next: DayRoute[] = [];
-        const failures: string[] = [];
-        for (let dayIndex = 0; dayIndex < groups.length; dayIndex++) {
-          const group = groups[dayIndex];
-          const endpoint = plannedEndpoints[dayIndex];
-          const points = routePointsForDay(group, endpoint);
-          const segments: RouteSegment[] = [];
-          if (
-            !(
-              points.length === 2 &&
-              samePlace(endpoint.origin, endpoint.destination)
-            )
-          ) {
-            const segmentResults: Array<RouteSegment | null> = Array.from(
-              { length: points.length - 1 },
-              () => null,
-            );
-            let cursor = 0;
-            const buildNext = async () => {
-              while (!controller.signal.aborted && cursor < points.length - 1) {
-                const index = cursor++;
-                try {
-                  const result = await fetchSegment(
-                    mode,
-                    points[index],
-                    points[index + 1],
-                  );
-                  segmentResults[index] = result.segment;
-                } catch (reason) {
-                  if (controller.signal.aborted) throw reason;
-                  failures.push(
-                    `第${dayIndex + 1}天 ${points[index].name}→${points[index + 1].name}：${reason instanceof Error ? reason.message : "生成失败"}`,
-                  );
-                }
-              }
-            };
-            await Promise.all(
-              Array.from(
-                { length: Math.min(2, points.length - 1) },
-                () => buildNext(),
-              ),
-            );
-            segments.push(
-              ...segmentResults.filter(
-                (segment): segment is RouteSegment => Boolean(segment),
-              ),
-            );
-          }
-          next.push({
-            day: dayIndex + 1,
-            color: DAY_COLORS[dayIndex],
-            spots: group,
-            segments,
-            distance: segments.reduce(
-              (sum, segment) => sum + segment.distance,
-              0,
-            ),
-            duration: segments.reduce(
-              (sum, segment) => sum + segment.duration,
-              0,
-            ),
-            origin: endpoint.origin,
-            destination: endpoint.destination,
-          });
-          if (!controller.signal.aborted)
-            setRoutesByMode((current) => ({
-              ...current,
-              [mode]: [
-                ...next,
-                ...emptyRoutes(days, plannedEndpoints).slice(next.length),
-              ],
-            }));
-        }
-        return { routes: next, failures };
-      };
-      const nextRoutes: Record<TravelMode, DayRoute[]> = {
-        driving: emptyRoutes(days, plannedEndpoints),
-        transit: emptyRoutes(days, plannedEndpoints),
-        walking: emptyRoutes(days, plannedEndpoints),
-      };
-      setRoutesByMode(nextRoutes);
-      await primeRouteBatch();
-      if (controller.signal.aborted) return;
-      const results = await Promise.all(
-        TRAVEL_MODES.map(async (mode) => {
-          const result = await buildMode(mode);
-          return { mode, ...result };
-        }),
-      ).catch((reason) => {
-        if (controller.signal.aborted) return null;
-        throw reason;
-      });
-      if (!results || controller.signal.aborted) return;
-      const failures: string[] = [];
-      for (const result of results) {
-        nextRoutes[result.mode] = result.routes;
-        if (result.failures.length)
-          failures.push(
-            `${modeLabel[result.mode]}有 ${result.failures.length} 段暂未生成`,
+        if (failures.size) {
+          const summary = modes
+            .map((mode) => {
+              const count = [...failures.keys()].filter(
+                (id) => jobs.get(id)?.mode === mode,
+              ).length;
+              return count ? `${modeLabel[mode]} ${count} 段未生成` : "";
+            })
+            .filter(Boolean)
+            .join("；");
+          setRouteError(
+            `${summary}。原因：${[...new Set(failures.values())].slice(0, 2).join("；")}。已完成路线仍可查看，可再次点击“选好了”重试缺失路段。`,
           );
-      }
-      if (!controller.signal.aborted) {
-        setRoutesByMode(nextRoutes);
-        const available = TRAVEL_MODES.filter((mode) =>
-          nextRoutes[mode].some((route) => route.segments.length),
+        }
+        const available = modes.filter((mode) =>
+          [...jobs.values()].some(
+            (job) => job.mode === mode && routeCache.current.has(job.id),
+          ),
         );
         if (!available.includes(displayMode) && available[0])
           setDisplayMode(available[0]);
-        if (failures.length)
-          setRouteError(
-            available.length
-              ? `${failures.join("；")}，其他路线仍可查看`
-              : failures.join("；"),
-          );
-        setPlanning(false);
+      } finally {
+        performance.mark("tuji-route-request-end");
+        if (!controller.signal.aborted) setPlanning(false);
       }
     }, 250);
     return () => {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [groupKey, endpointKey, hasCommittedPlan, city.routeCity]);
+  }, [groupKey, endpointKey, hasCommittedPlan, city.routeCity, planRevision]);
   useEffect(() => {
     if (!routeError) return;
-    const timer = window.setTimeout(() => setRouteError(""), 5000);
+    const timer = window.setTimeout(() => setRouteError(""), 20000);
     return () => window.clearTimeout(timer);
   }, [routeError]);
   const markDirty = () => setPlanDirty(true);
@@ -3714,7 +3739,9 @@ function Planner({
       } as Spot);
     if (!existing)
       setCustomSpots((old) =>
-        old.some((item) => item.id === spot.id || item.location === spot.location)
+        old.some(
+          (item) => item.id === spot.id || item.location === spot.location,
+        )
           ? old
           : [...old, spot],
       );
@@ -3754,16 +3781,17 @@ function Planner({
       return next;
     });
     const hasConfirmedStay = stays.some((stay) => Boolean(stay.place));
-    const nextEndpoints = !hasConfirmedStay && !endpointsCustomized
-      ? nextGroups.map((group, index) => {
-          const fallback = draftEndpoints[index] || draftEndpoints.at(-1)!;
-          if (!group.length) return fallback;
-          return {
-            origin: group[0],
-            destination: group[group.length - 1],
-          };
-        })
-      : draftEndpoints.map((endpoint) => ({ ...endpoint }));
+    const nextEndpoints =
+      !hasConfirmedStay && !endpointsCustomized
+        ? nextGroups.map((group, index) => {
+            const fallback = draftEndpoints[index] || draftEndpoints.at(-1)!;
+            if (!group.length) return fallback;
+            return {
+              origin: group[0],
+              destination: group[group.length - 1],
+            };
+          })
+        : draftEndpoints.map((endpoint) => ({ ...endpoint }));
     setPlannedEndpoints(nextEndpoints);
     setDraftEndpoints(nextEndpoints.map((endpoint) => ({ ...endpoint })));
     setPlannedGroups(nextGroups);
@@ -3835,9 +3863,7 @@ function Planner({
   return (
     <main
       className={`planner-screen ${navOpen ? "nav-is-open" : ""}`}
-      style={
-        { "--text-scale": textScale * 1.15 } as React.CSSProperties
-      }
+      style={{ "--text-scale": textScale * 1.15 } as React.CSSProperties}
     >
       <header className="map-header">
         <button className="brand-button" onClick={onBack}>
@@ -3906,6 +3932,7 @@ function Planner({
         endpoint={draftEndpoints[activeDay]}
         onEndpoint={editEndpoint}
         planning={planning}
+        planningProgress={planningProgress}
         mode={displayMode}
         onMode={setDisplayMode}
         onRemove={remove}
@@ -3983,8 +4010,8 @@ function Planner({
               {!cardImagesReady
                 ? "图片准备中"
                 : cardsDone
-                ? `${selected.length} 个想去`
-                : `还剩 ${Math.max(0, cardSpots.length - decided)} 个`}
+                  ? `${selected.length} 个想去`
+                  : `还剩 ${Math.max(0, cardSpots.length - decided)} 个`}
             </small>
           </div>
           <em aria-hidden="true">→</em>
@@ -4045,8 +4072,7 @@ export default function App() {
     void loadAmap().catch(() => undefined);
     void prepareCityCached(city).then((prepared) => {
       cityCache.current.set(city.id, prepared);
-      if (active)
-        void preloadAttractionImages(selectCardSpots(prepared.spots));
+      if (active) void preloadAttractionImages(selectCardSpots(prepared.spots));
     });
     return () => {
       active = false;

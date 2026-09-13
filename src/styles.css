@@ -412,6 +412,27 @@ button {
   flex-direction: column;
   backdrop-filter: blur(16px);
 }
+.day-load-hint {
+  margin: 8px 0 14px;
+  color: #62736d;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.search-status {
+  padding: 16px;
+  color: #62736d;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.day-load-hint strong {
+  display: block;
+  padding: 7px 10px;
+  margin-top: 6px;
+  border-radius: 10px;
+  color: #965220;
+  background: #fff2df;
+  font-weight: 500;
+}
 .dock-top {
   display: flex;
   justify-content: space-between;

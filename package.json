@@ -1,6 +1,6 @@
 {
   "name": "tujimap",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "基于真实地图与可解释启发式算法的城市多日旅行路线规划工具",
   "private": true,
   "license": "MIT",
@@ -16,7 +16,8 @@
     "dev": "vite",
     "build": "vite build",
     "start": "vite preview",
-    "test": "npm run build",
+    "test": "npm run typecheck && npm run test:routing && npm run build",
+    "test:routing": "node --test tests/routing.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

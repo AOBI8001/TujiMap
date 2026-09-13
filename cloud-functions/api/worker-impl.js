@@ -1,3 +1,5 @@
+import { requestAmap } from "./amap-gateway.js";
+
 const json = (body, status = 200, headers = {}) =>
   new Response(JSON.stringify(body), {
     status,
@@ -8,9 +10,7 @@ const json = (body, status = 200, headers = {}) =>
   });
 
 const memoryCache = new Map();
-const serviceSchedulers = new Map();
 const MAX_CACHE_ENTRIES = 500;
-const AMAP_MIN_INTERVAL = 420;
 
 const sleep = (milliseconds) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -29,53 +29,6 @@ const remember = (key, value, ttl) => {
   if (memoryCache.size >= MAX_CACHE_ENTRIES)
     memoryCache.delete(memoryCache.keys().next().value);
   memoryCache.set(key, { value, expires: Date.now() + ttl });
-};
-
-// 同一热实例内，每种高德服务保留 420ms 间隔，单实例约 2.38 QPS。
-// 用户搜索与路线拥有更高优先级，不会再被卡片图片后台预热堵在队尾。
-const drainAmapQueue = async (state) => {
-  if (state.running) return;
-  state.running = true;
-  try {
-    while (state.queue.length) {
-      state.queue.sort(
-        (a, b) => b.priority - a.priority || a.sequence - b.sequence,
-      );
-      const job = state.queue.shift();
-      const elapsed = Date.now() - state.lastStarted;
-      if (elapsed < AMAP_MIN_INTERVAL) await sleep(AMAP_MIN_INTERVAL - elapsed);
-      state.lastStarted = Date.now();
-      try {
-        job.resolve(await job.task());
-      } catch (error) {
-        job.reject(error);
-      }
-    }
-  } finally {
-    state.running = false;
-    // 有任务恰好在 while 判空与 running 复位之间入队时，重新启动排空，
-    // 避免该请求永远停在队列里，导致整次多点规划持续“规划中”。
-    if (state.queue.length) void drainAmapQueue(state);
-  }
-};
-
-let amapJobSequence = 0;
-const scheduleAmap = (service, task, priority = 0) => {
-  let state = serviceSchedulers.get(service);
-  if (!state) {
-    state = { queue: [], running: false, lastStarted: 0 };
-    serviceSchedulers.set(service, state);
-  }
-  return new Promise((resolve, reject) => {
-    state.queue.push({
-      task,
-      priority,
-      sequence: amapJobSequence++,
-      resolve,
-      reject,
-    });
-    void drainAmapQueue(state);
-  });
 };
 
 const bodyJson = async (request) => {
@@ -222,7 +175,10 @@ async function proxyAmapPhoto(source) {
     }
   }
   return json(
-    { error: lastError instanceof Error ? lastError.message : "景点图片加载失败" },
+    {
+      error:
+        lastError instanceof Error ? lastError.message : "景点图片加载失败",
+    },
     502,
   );
 }
@@ -232,34 +188,11 @@ const straightDistanceKm = (from, to) => {
   const [toLng, toLat] = String(to).split(",").map(Number);
   const latitude = ((fromLat + toLat) / 2) * (Math.PI / 180);
   return (
-    Math.hypot(
-      (toLng - fromLng) * Math.cos(latitude),
-      toLat - fromLat,
-    ) * 111.32
+    Math.hypot((toLng - fromLng) * Math.cos(latitude), toLat - fromLat) * 111.32
   );
 };
 
-const requestJson = async (target, options = {}) => {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    Math.max(1000, Number(options.timeout) || 6500),
-  );
-  try {
-    const response = await fetch(target, {
-      method: options.method || "GET",
-      headers: options.headers || {},
-      body: options.body,
-      signal: controller.signal,
-    });
-    const raw = await response.text();
-    return raw ? JSON.parse(raw) : {};
-  } finally {
-    clearTimeout(timeout);
-  }
-};
-
-async function api(request, env, url) {
+async function api(request, env, url, context) {
   if (url.pathname === "/api/amap-photo") {
     let source = String(url.searchParams.get("url") || "").slice(0, 1800);
     if (source && url.searchParams.get("proxy") === "1")
@@ -285,13 +218,10 @@ async function api(request, env, url) {
       });
       let data;
       try {
-        data = await scheduleAmap(
-          "places",
-          () =>
-            requestJson(`https://restapi.amap.com/v5/place/text?${params}`, {
-              timeout: 5500,
-            }),
-          -10,
+        data = await requestAmap(
+          env,
+          `https://restapi.amap.com/v5/place/text?${params}`,
+          { timeout: 5500, priority: -10, budget: 12000 },
         );
       } catch {
         return json({ error: "高德景点图片查询失败" }, 502);
@@ -341,14 +271,10 @@ async function api(request, env, url) {
           show_fields: "photos",
         });
         try {
-          const fallbackData = await scheduleAmap(
-            "places",
-            () =>
-              requestJson(
-                `https://restapi.amap.com/v5/place/text?${fallbackParams}`,
-                { timeout: 5500 },
-              ),
-            -10,
+          const fallbackData = await requestAmap(
+            env,
+            `https://restapi.amap.com/v5/place/text?${fallbackParams}`,
+            { timeout: 5500, priority: -10, budget: 12000 },
           );
           const fallbackSource = preferredAmapPhoto(
             fallbackData?.pois?.find((poi) => preferredAmapPhoto(poi.photos))
@@ -360,23 +286,26 @@ async function api(request, env, url) {
         }
       }
     }
-    if (!photoUrl) return json({ error: "该景点暂无可用图片" }, 404);
+    if (!photoUrl)
+      return json({ error: "该景点暂无可用图片" }, 404, {
+        "cache-control": "public, max-age=600, s-maxage=3600",
+      });
     const clientPhotoUrl = needsPhotoProxy(photoUrl)
       ? `/api/amap-photo?url=${encodeURIComponent(photoUrl)}&proxy=1`
       : photoUrl;
     if (url.searchParams.get("format") === "json")
-      return json(
-        { url: clientPhotoUrl },
-        200,
-        {
-          "cache-control":
-            "public, max-age=604800, s-maxage=2592000, stale-while-revalidate=86400",
-        },
-      );
-    return redirectAmapPhoto(photoUrl);
+      return json({ url: clientPhotoUrl }, 200, {
+        "cache-control":
+          "public, max-age=604800, s-maxage=2592000, stale-while-revalidate=86400",
+      });
+    return (
+      redirectAmapPhoto(photoUrl) || json({ error: "该景点暂无可用图片" }, 404)
+    );
   }
   if (url.pathname === "/api/status")
     return json({
+      version: "1.3.0",
+      amapScheduler: env.AMAP_GATEWAY ? "shared-gateway" : "local-process",
       deepseek: Boolean(env.DEEPSEEK_API_KEY),
       amapMap: Boolean(env.AMAP_JS_KEY && env.AMAP_SECURITY_CODE),
       amapService: Boolean(env.AMAP_WEB_SERVICE_KEY),
@@ -385,11 +314,9 @@ async function api(request, env, url) {
   if (url.pathname === "/api/amap-config") {
     if (!env.AMAP_JS_KEY || !env.AMAP_SECURITY_CODE)
       return json({ error: "尚未配置高德 Web端 Key 与安全密钥" }, 503);
-    return json(
-      { key: env.AMAP_JS_KEY, serviceHost: "/_AMapService" },
-      200,
-      { "cache-control": "no-store" },
-    );
+    return json({ key: env.AMAP_JS_KEY, serviceHost: "/_AMapService" }, 200, {
+      "cache-control": "no-store",
+    });
   }
   if (url.pathname === "/api/places") {
     if (!env.AMAP_WEB_SERVICE_KEY)
@@ -416,23 +343,23 @@ async function api(request, env, url) {
       });
     let data;
     let placeError;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 1; attempt++) {
       try {
-        data = await scheduleAmap(
-          "places",
-          () =>
-            requestJson(`https://restapi.amap.com/v5/place/text?${params}`, {
-              timeout: 5500,
-            }),
-          20,
+        data = await requestAmap(
+          env,
+          `https://restapi.amap.com/v5/place/text?${params}`,
+          { timeout: 5500, priority: 20, budget: 6500 },
         );
         if (data?.status === "1") break;
-        if (!/QPS_HAS_EXCEEDED|SERVER_IS_BUSY|GATEWAY_TIMEOUT/i.test(String(data?.info || "")))
+        if (
+          !/QPS_HAS_EXCEEDED|SERVER_IS_BUSY|GATEWAY_TIMEOUT/i.test(
+            String(data?.info || ""),
+          )
+        )
           break;
       } catch (error) {
         placeError = error;
       }
-      if (attempt === 0) await sleep(950 + Math.random() * 250);
     }
     if (!data) {
       const error = placeError;
@@ -479,14 +406,16 @@ async function api(request, env, url) {
       return json({ error: "批量路线接口仅支持 POST" }, 405);
     let payload;
     try {
-      payload = await request.json();
+      payload = await bodyJson(request);
     } catch {
       return json({ error: "批量路线参数格式错误" }, 400);
     }
     const routeCity = String(payload?.city || "").slice(0, 20);
+    if (!Array.isArray(payload?.items) || payload.items.length > 12)
+      return json({ error: "每批最多提交 12 段路线" }, 400);
     const coordinatePattern = /^-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?$/;
     const items = (Array.isArray(payload?.items) ? payload.items : [])
-      .slice(0, 21)
+      .slice(0, 12)
       .map((item, index) => ({
         id: String(item?.id || index).slice(0, 240),
         origin: String(item?.origin || ""),
@@ -502,6 +431,8 @@ async function api(request, env, url) {
       );
     if (!items.length) return json({ error: "没有可规划的路线段" }, 400);
 
+    const startedAt = Date.now();
+    const batchEnv = { ...env, AMAP_DEADLINE: startedAt + 28000 };
     const results = Array(items.length);
     let cursor = 0;
     const processNext = async () => {
@@ -510,15 +441,19 @@ async function api(request, env, url) {
         const item = items[index];
         let lastError = "路线服务网络波动，请重试";
         for (let attempt = 0; attempt < 2; attempt += 1) {
+          if (Date.now() >= batchEnv.AMAP_DEADLINE) {
+            lastError = "本批路线请求超时，请重试缺失路段";
+            break;
+          }
           const target = new URL("/api/route", url.origin);
           target.searchParams.set("origin", item.origin);
           target.searchParams.set("destination", item.destination);
           target.searchParams.set("mode", item.mode);
           target.searchParams.set("city", routeCity);
-          const response = await api(
+          const response = await handleApiRequest(
             new Request(target.toString()),
-            env,
-            target,
+            batchEnv,
+            context,
           );
           const raw = await response.text();
           let data = {};
@@ -532,11 +467,16 @@ async function api(request, env, url) {
             (data.stationary ||
               (Array.isArray(data.polyline) && data.polyline.length >= 2))
           ) {
-            results[index] = { id: item.id, ok: true, data };
+            results[index] = {
+              id: item.id,
+              ok: true,
+              data,
+              cache: response.headers.get("x-tuji-cache") || "miss",
+            };
             break;
           }
           lastError = String(data.error || "路线服务网络波动，请重试");
-          if (/距离超出|参数|不在当前城市/.test(lastError)) break;
+          if (data.retryable !== true) break;
           if (attempt === 0) await sleep(500);
         }
         if (!results[index])
@@ -547,7 +487,29 @@ async function api(request, env, url) {
       Array.from({ length: Math.min(6, items.length) }, () => processNext()),
     );
     return json(
-      { results },
+      {
+        results,
+        elapsedMs: Date.now() - startedAt,
+        timing: {
+          upstreamCalls: env.AMAP_METRICS?.length || 0,
+          queueMs: Math.round(
+            (env.AMAP_METRICS || []).reduce(
+              (sum, item) => sum + item.queueMs,
+              0,
+            ),
+          ),
+          upstreamMs: Math.round(
+            (env.AMAP_METRICS || []).reduce(
+              (sum, item) => sum + item.upstreamMs,
+              0,
+            ),
+          ),
+          maxQueueMs: Math.max(
+            0,
+            ...(env.AMAP_METRICS || []).map((item) => item.queueMs),
+          ),
+        },
+      },
       200,
       { "cache-control": "no-store", "x-tuji-batch": "1" },
     );
@@ -608,14 +570,10 @@ async function api(request, env, url) {
           page_num: "1",
         });
         try {
-          const cityData = await scheduleAmap(
-            "places",
-            () =>
-              requestJson(
-                `https://restapi.amap.com/v5/place/text?${cityParams}`,
-                { timeout: 4500 },
-              ),
-            30,
+          const cityData = await requestAmap(
+            env,
+            `https://restapi.amap.com/v5/place/text?${cityParams}`,
+            { timeout: 4500, priority: 30, budget: 12000 },
           );
           const code = String(cityData?.pois?.[0]?.citycode || "");
           if (/^\d{3,6}$/.test(code)) {
@@ -657,14 +615,10 @@ async function api(request, env, url) {
       let result = {};
       for (let attempt = 0; attempt < 1; attempt++) {
         try {
-          result = await scheduleAmap(
-            `direction:${targetEndpoint}`,
-            () =>
-              requestJson(
-                `https://restapi.amap.com/v5/direction/${targetEndpoint}?${targetParams}`,
-                { timeout: 5500 },
-              ),
-            10,
+          result = await requestAmap(
+            env,
+            `https://restapi.amap.com/v5/direction/${targetEndpoint}?${targetParams}`,
+            { timeout: 5500, priority: 10, budget: 12000 },
           );
         } catch (reason) {
           console.error("AMap direction request failed", {
@@ -698,12 +652,17 @@ async function api(request, env, url) {
                 ? "两地点距离超出步行规划范围，请检查地点是否位于当前城市"
                 : data.info || "高德路线规划失败",
           infocode: data.infocode,
+          retryable:
+            /QPS_HAS_EXCEEDED|SERVER_IS_BUSY|GATEWAY_TIMEOUT|ROUTE_TIMEOUT|ROUTE_NETWORK_ERROR/i.test(
+              String(data.info || ""),
+            ),
         },
         502,
       );
     let resolvedMode = mode;
     let walkingFallback = false;
-    let plan = mode === "transit" ? data.route?.transits?.[0] : data.route?.paths?.[0];
+    let plan =
+      mode === "transit" ? data.route?.transits?.[0] : data.route?.paths?.[0];
     if (
       !plan &&
       mode === "transit" &&
@@ -839,9 +798,11 @@ async function api(request, env, url) {
       ? body.availableSpots.map(String).slice(0, 180)
       : [];
     const currentPlan = Array.isArray(body.currentPlan)
-      ? body.currentPlan.slice(0, days).map((items) =>
-          Array.isArray(items) ? items.map(String).slice(0, 20) : [],
-        )
+      ? body.currentPlan
+          .slice(0, days)
+          .map((items) =>
+            Array.isArray(items) ? items.map(String).slice(0, 20) : [],
+          )
       : [];
     if (!content.trim()) return json({ error: "请输入行程要求" }, 400);
     const requestBody = JSON.stringify({
@@ -930,9 +891,7 @@ async function api(request, env, url) {
       );
     }
     try {
-      const parsed = JSON.parse(
-        data.choices?.[0]?.message?.content || "{}",
-      );
+      const parsed = JSON.parse(data.choices?.[0]?.message?.content || "{}");
       const seen = new Set();
       const spots = (Array.isArray(parsed.spots) ? parsed.spots : [])
         .map((item) => {
@@ -940,7 +899,9 @@ async function api(request, env, url) {
           const preference = item?.preference === "avoid" ? "avoid" : "like";
           const numericDay = Number(item?.day);
           const day =
-            Number.isInteger(numericDay) && numericDay >= 1 && numericDay <= days
+            Number.isInteger(numericDay) &&
+            numericDay >= 1 &&
+            numericDay <= days
               ? numericDay
               : null;
           const afterName = String(item?.after || "").trim();
@@ -967,6 +928,7 @@ async function api(request, env, url) {
 }
 
 export async function handleApiRequest(request, env, context) {
+  env = { ...env, AMAP_METRICS: env.AMAP_METRICS || [] };
   try {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/api/"))
@@ -978,12 +940,18 @@ export async function handleApiRequest(request, env, context) {
     const edgeCache = cacheable ? caches.default : null;
     if (edgeCache) {
       const cached = await edgeCache.match(request);
-      if (cached) return cached;
+      if (cached) {
+        const headers = new Headers(cached.headers);
+        headers.set("x-tuji-cache", "edge");
+        return new Response(cached.body, { status: cached.status, headers });
+      }
     }
-    const response = await api(request, env, url);
+    const response = await api(request, env, url, context);
     if (
       edgeCache &&
-      (response.ok || [301, 302, 307, 308].includes(response.status)) &&
+      (response.ok ||
+        [301, 302, 307, 308].includes(response.status) ||
+        (url.pathname === "/api/amap-photo" && response.status === 404)) &&
       /public/i.test(response.headers.get("cache-control") || "")
     ) {
       const write = edgeCache.put(request, response.clone());

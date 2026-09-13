@@ -2,6 +2,7 @@ import {
   handleApiRequest,
   proxyAmapJsService,
 } from "./cloud-functions/api/worker-impl.js";
+export { AmapGateway } from "./cloud-functions/api/amap-gateway.js";
 
 /**
  * Cloudflare Workers 入口：
