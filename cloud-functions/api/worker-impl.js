@@ -307,7 +307,7 @@ async function api(request, env, url, context) {
   }
   if (url.pathname === "/api/status")
     return json({
-      version: "1.3.0",
+      version: "1.4.0",
       amapScheduler: env.AMAP_GATEWAY ? "shared-gateway" : "local-process",
       deepseek: Boolean(env.DEEPSEEK_API_KEY),
       amapMap: Boolean(env.AMAP_JS_KEY && env.AMAP_SECURITY_CODE),
