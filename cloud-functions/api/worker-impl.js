@@ -1,4 +1,5 @@
 import { requestAmap } from "./amap-gateway.js";
+import { deepseekModel, recognizeImage } from "./image-recognition.js";
 
 const json = (body, status = 200, headers = {}) =>
   new Response(JSON.stringify(body), {
@@ -193,6 +194,8 @@ const straightDistanceKm = (from, to) => {
 };
 
 async function api(request, env, url, context) {
+  if (url.pathname === "/api/recognize-image" && request.method === "POST")
+    return recognizeImage(request, env);
   if (url.pathname === "/api/amap-photo") {
     let source = String(url.searchParams.get("url") || "").slice(0, 1800);
     if (source && url.searchParams.get("proxy") === "1")
@@ -309,7 +312,7 @@ async function api(request, env, url, context) {
       deepseek: Boolean(env.DEEPSEEK_API_KEY),
       amapMap: Boolean(env.AMAP_JS_KEY && env.AMAP_SECURITY_CODE),
       amapService: Boolean(env.AMAP_WEB_SERVICE_KEY),
-      model: env.DEEPSEEK_MODEL || "deepseek-v4-flash",
+      model: deepseekModel(env),
     });
   if (url.pathname === "/api/amap-config") {
     if (!env.AMAP_JS_KEY || !env.AMAP_SECURITY_CODE)
@@ -806,7 +809,7 @@ async function api(request, env, url, context) {
       : [];
     if (!content.trim()) return json({ error: "请输入行程要求" }, 400);
     const requestBody = JSON.stringify({
-      model: env.DEEPSEEK_MODEL || "deepseek-v4-flash",
+      model: deepseekModel(env),
       messages: [
         {
           role: "system",
@@ -884,7 +887,7 @@ async function api(request, env, url, context) {
       return json(
         {
           error: busy
-            ? "DeepSeek-V4-Flash 当前访问量较大或响应超时，请稍后重试"
+            ? "DeepSeek 当前访问量较大或响应超时，请稍后重试"
             : message || "DeepSeek 模型调用失败",
         },
         busy ? 503 : Math.min(599, Math.max(400, response.status)),
@@ -918,7 +921,7 @@ async function api(request, env, url, context) {
           .map(String)
           .filter(Boolean)
           .slice(0, 3),
-        source: env.DEEPSEEK_MODEL || "deepseek-v4-flash",
+        source: deepseekModel(env),
       });
     } catch {
       return json({ error: "模型返回格式异常，请重新提交一次" }, 502);

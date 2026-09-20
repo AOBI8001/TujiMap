@@ -1,5 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  ImageImport,
+  type ImportedTrip,
+  type ImageTripRequest,
+} from "./ImageImport";
+import { ImagePlanResolver } from "./ImagePlanResolver";
+import {
   CITIES,
   DAY_COLORS,
   cityById,
@@ -1510,6 +1516,7 @@ function Setup({
   setStays,
   onEnter,
   entering,
+  onImport,
 }: {
   cityId: CityId | null;
   setCityId: (city: CityId) => void;
@@ -1519,7 +1526,9 @@ function Setup({
   setStays: (stays: Stay[]) => void;
   onEnter: () => void;
   entering: boolean;
+  onImport: (trip: ImageTripRequest) => Promise<void>;
 }) {
+  const [setupTab, setSetupTab] = useState<"free" | "image">("free");
   const [candidate, setCandidate] = useState<Place | undefined>();
   const [cityMenuOpen, setCityMenuOpen] = useState(false);
   const [cityQuery, setCityQuery] = useState("");
@@ -1621,7 +1630,7 @@ function Setup({
       ?.scrollIntoView({ behavior: "smooth", block: "start" });
   const firstMatch = visibleGroups[0]?.[1]?.[0];
   return (
-    <main className="setup-screen">
+    <main className="setup-screen setup-redesigned">
       <header>
         <div className="brand-cluster">
           <GitHubLink />
@@ -1639,201 +1648,259 @@ function Setup({
         </h1>
         <p>选好城市和住处，开始规划你的城市环线。</p>
       </section>
-      <section className="setup-card stay-setup">
-        <div className="setup-field-head destination-head">
-          <span>目的地</span>
-          <small>{city ? "可输入城市名或拼音切换" : "输入城市名或拼音"}</small>
-        </div>
-        <div className={`city-control ${cityMenuOpen ? "open" : ""}`}>
-          <div
-            className={`city-select city-combobox ${city ? "selected" : "empty"}`}
+      <section
+        className="setup-card stay-setup with-tabs"
+        data-entry={setupTab}
+      >
+        <div className="setup-bookmarks" role="tablist" aria-label="规划方式">
+          <button
+            id="free-tab"
+            role="tab"
+            aria-selected={setupTab === "free"}
+            aria-controls="free-panel"
+            onClick={() => setSetupTab("free")}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowRight") {
+                setSetupTab("image");
+                document.getElementById("image-tab")?.focus();
+              }
+            }}
           >
-            <span>
-              <input
-                aria-label="选择城市"
-                value={cityMenuOpen ? cityQuery : city?.name || ""}
-                placeholder="输入城市名或拼音"
-                onFocus={() => {
-                  setCityMenuOpen(true);
+            自由选择
+          </button>
+          <button
+            id="image-tab"
+            role="tab"
+            aria-selected={setupTab === "image"}
+            aria-controls="image-panel"
+            onClick={() => setSetupTab("image")}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowLeft") {
+                setSetupTab("free");
+                document.getElementById("free-tab")?.focus();
+              }
+            }}
+          >
+            图片识别
+          </button>
+        </div>
+        <div
+          id="image-panel"
+          role="tabpanel"
+          aria-labelledby="image-tab"
+          className="setup-panel"
+          hidden={setupTab !== "image"}
+        >
+          <ImageImport cityId={cityId} days={days} onImport={onImport} />
+        </div>
+        <div
+          id="free-panel"
+          role="tabpanel"
+          aria-labelledby="free-tab"
+          className="setup-panel"
+          hidden={setupTab !== "free"}
+        >
+          <div className="setup-field-head destination-head">
+            <span>目的地</span>
+            <small>
+              {city ? "可输入城市名或拼音切换" : "输入城市名或拼音"}
+            </small>
+          </div>
+          <div className={`city-control ${cityMenuOpen ? "open" : ""}`}>
+            <div
+              className={`city-select city-combobox ${city ? "selected" : "empty"}`}
+            >
+              <span>
+                <input
+                  aria-label="选择城市"
+                  value={cityMenuOpen ? cityQuery : city?.name || ""}
+                  placeholder="输入城市名或拼音"
+                  onFocus={() => {
+                    setCityMenuOpen(true);
+                    setCityQuery("");
+                  }}
+                  onChange={(event) => {
+                    setCityQuery(event.target.value);
+                    setCityMenuOpen(true);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && firstMatch)
+                      changeCity(firstMatch.id);
+                  }}
+                />
+                <small>
+                  {cityMenuOpen
+                    ? query
+                      ? `${visibleGroups.reduce((sum, [, items]) => sum + items.length, 0)} 个匹配城市`
+                      : "按 A–Z 排列"
+                    : city
+                      ? city.pinyin
+                      : "支持 100 座城市"}
+                </small>
+              </span>
+              <button
+                type="button"
+                aria-label="展开城市列表"
+                aria-expanded={cityMenuOpen}
+                onClick={() => {
+                  setCityMenuOpen((open) => !open);
                   setCityQuery("");
                 }}
-                onChange={(event) => {
-                  setCityQuery(event.target.value);
-                  setCityMenuOpen(true);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && firstMatch)
-                    changeCity(firstMatch.id);
-                }}
-              />
-              <small>
-                {cityMenuOpen
-                  ? query
-                    ? `${visibleGroups.reduce((sum, [, items]) => sum + items.length, 0)} 个匹配城市`
-                    : "按 A–Z 排列"
-                  : city
-                    ? city.pinyin
-                    : "支持 100 座城市"}
-              </small>
-            </span>
-            <button
-              type="button"
-              aria-label="展开城市列表"
-              aria-expanded={cityMenuOpen}
-              onClick={() => {
-                setCityMenuOpen((open) => !open);
-                setCityQuery("");
-              }}
-            >
-              ⌄
-            </button>
-          </div>
-          {cityMenuOpen && (
-            <div className="city-menu city-menu-indexed">
-              <div className="city-list" ref={cityListRef}>
-                {visibleGroups.length ? (
-                  visibleGroups.map(([letter, items]) => (
-                    <section
-                      className="city-letter-group"
-                      data-letter={letter}
-                      key={letter}
-                    >
-                      <strong>{letter}</strong>
-                      {items.map((item) => (
+              >
+                ⌄
+              </button>
+            </div>
+            {cityMenuOpen && (
+              <div className="city-menu city-menu-indexed">
+                <div className="city-list" ref={cityListRef}>
+                  {visibleGroups.length ? (
+                    visibleGroups.map(([letter, items]) => (
+                      <section
+                        className="city-letter-group"
+                        data-letter={letter}
+                        key={letter}
+                      >
+                        <strong>{letter}</strong>
+                        {items.map((item) => (
+                          <button
+                            key={item.id}
+                            className={item.id === cityId ? "active" : ""}
+                            onClick={() => changeCity(item.id)}
+                          >
+                            <span>
+                              <b>{item.name}</b>
+                              <small>{item.pinyin}</small>
+                            </span>
+                            <i>{item.id === cityId ? "✓" : ""}</i>
+                          </button>
+                        ))}
+                      </section>
+                    ))
+                  ) : (
+                    <div className="city-empty">没有匹配的城市</div>
+                  )}
+                </div>
+                {!query && (
+                  <nav className="city-index" aria-label="城市首字母索引">
+                    {CITY_ALPHABET.map((letter) => {
+                      const available = CITY_GROUPS.some(
+                        ([group]) => group === letter,
+                      );
+                      return (
                         <button
-                          key={item.id}
-                          className={item.id === cityId ? "active" : ""}
-                          onClick={() => changeCity(item.id)}
+                          key={letter}
+                          type="button"
+                          disabled={!available}
+                          onClick={() => jumpToLetter(letter)}
+                          aria-label={`跳转到${letter}`}
                         >
-                          <span>
-                            <b>{item.name}</b>
-                            <small>{item.pinyin}</small>
-                          </span>
-                          <i>{item.id === cityId ? "✓" : ""}</i>
+                          {letter}
                         </button>
-                      ))}
-                    </section>
-                  ))
-                ) : (
-                  <div className="city-empty">没有匹配的城市</div>
+                      );
+                    })}
+                  </nav>
                 )}
               </div>
-              {!query && (
-                <nav className="city-index" aria-label="城市首字母索引">
-                  {CITY_ALPHABET.map((letter) => {
-                    const available = CITY_GROUPS.some(
-                      ([group]) => group === letter,
-                    );
-                    return (
-                      <button
-                        key={letter}
-                        type="button"
-                        disabled={!available}
-                        onClick={() => jumpToLetter(letter)}
-                        aria-label={`跳转到${letter}`}
-                      >
-                        {letter}
-                      </button>
-                    );
-                  })}
-                </nav>
+            )}
+          </div>
+          <div className="setup-section days-section">
+            <div className="setup-field-head">
+              <span>旅行天数</span>
+              <strong>
+                {days}
+                <small>天</small>
+              </strong>
+            </div>
+            <input
+              className="days-slider"
+              style={
+                {
+                  "--days-progress": `${((days - 1) / 6) * 100}%`,
+                } as React.CSSProperties
+              }
+              type="range"
+              min="1"
+              max="7"
+              value={days}
+              onChange={(event) => changeDays(Number(event.target.value))}
+            />
+            <div className="range-labels">
+              <span>1 天</span>
+              <i>左右拖动</i>
+              <span>7 天</span>
+            </div>
+          </div>
+          <div className="setup-section stays-section">
+            <div className="setup-field-head">
+              <span>住处安排</span>
+              <small>{stays.length > 1 ? "拖动白色分界调整" : ""}</small>
+            </div>
+            <StayTimeline days={days} stays={stays} onChange={setStays} />
+            <div className="stay-list">
+              {stays.map((stay, index) => (
+                <span key={stay.id}>
+                  <i style={{ background: stay.color }} />
+                  {stay.place?.name || "暂定住处"}
+                  {stay.place && stays.length > 1 && (
+                    <button
+                      onClick={() => removeStay(index)}
+                      aria-label={`移除${stay.place.name}`}
+                    >
+                      ×
+                    </button>
+                  )}
+                </span>
+              ))}
+              {!stays.some((stay) => !stay.place) && (
+                <button
+                  className="add-tentative"
+                  onClick={addTentative}
+                  disabled={stays.length >= days}
+                >
+                  <span>暂定住处</span>
+                  <b>＋</b>
+                </button>
               )}
             </div>
-          )}
-        </div>
-        <div className="setup-section days-section">
-          <div className="setup-field-head">
-            <span>旅行天数</span>
-            <strong>
-              {days}
-              <small>天</small>
-            </strong>
-          </div>
-          <input
-            className="days-slider"
-            style={
-              {
-                "--days-progress": `${((days - 1) / 6) * 100}%`,
-              } as React.CSSProperties
-            }
-            type="range"
-            min="1"
-            max="7"
-            value={days}
-            onChange={(event) => changeDays(Number(event.target.value))}
-          />
-          <div className="range-labels">
-            <span>1 天</span>
-            <i>左右拖动</i>
-            <span>7 天</span>
-          </div>
-        </div>
-        <div className="setup-section stays-section">
-          <div className="setup-field-head">
-            <span>住处安排</span>
-            <small>{stays.length > 1 ? "拖动白色分界调整" : ""}</small>
-          </div>
-          <StayTimeline days={days} stays={stays} onChange={setStays} />
-          <div className="stay-list">
-            {stays.map((stay, index) => (
-              <span key={stay.id}>
-                <i style={{ background: stay.color }} />
-                {stay.place?.name || "暂定住处"}
-                {stay.place && stays.length > 1 && (
-                  <button
-                    onClick={() => removeStay(index)}
-                    aria-label={`移除${stay.place.name}`}
-                  >
-                    ×
-                  </button>
-                )}
-              </span>
-            ))}
-            {!stays.some((stay) => !stay.place) && (
+            <div className="add-stay">
+              {city ? (
+                <PlaceField
+                  value={candidate}
+                  onSelect={setCandidate}
+                  cityName={city.name}
+                  placeholder={`输入${city.name}酒店或住处`}
+                  compact
+                />
+              ) : (
+                <div className="city-required">选择城市后搜索住处</div>
+              )}
               <button
-                className="add-tentative"
-                onClick={addTentative}
-                disabled={stays.length >= days}
+                onClick={addStay}
+                disabled={
+                  !city ||
+                  !candidate ||
+                  (stays.length >= days && !stays.every((stay) => !stay.place))
+                }
               >
-                <span>暂定住处</span>
-                <b>＋</b>
+                新增
               </button>
-            )}
+            </div>
           </div>
-          <div className="add-stay">
-            {city ? (
-              <PlaceField
-                value={candidate}
-                onSelect={setCandidate}
-                cityName={city.name}
-                placeholder={`输入${city.name}酒店或住处`}
-                compact
-              />
-            ) : (
-              <div className="city-required">选择城市后搜索住处</div>
-            )}
-            <button
-              onClick={addStay}
-              disabled={
-                !city ||
-                !candidate ||
-                (stays.length >= days && !stays.every((stay) => !stay.place))
-              }
-            >
-              新增
-            </button>
-          </div>
+          <button
+            className={`enter-button ${entering ? "loading" : ""}`}
+            onClick={onEnter}
+            disabled={!city || entering}
+          >
+            <span>
+              {entering
+                ? "正在载入城市景点"
+                : city
+                  ? "进入地图"
+                  : "请先选择城市"}
+            </span>
+            <i>{entering ? "•••" : "→"}</i>
+          </button>
         </div>
-        <button
-          className={`enter-button ${entering ? "loading" : ""}`}
-          onClick={onEnter}
-          disabled={!city || entering}
-        >
-          <span>
-            {entering ? "正在载入城市景点" : city ? "进入地图" : "请先选择城市"}
-          </span>
-          <i>{entering ? "•••" : "→"}</i>
-        </button>
       </section>
       <div className="loop-orbit" aria-hidden="true">
         <i />
@@ -2448,9 +2515,16 @@ function MapCanvas({
       } else {
         // Include all planned stops on the first batch, so later batches don't
         // need to zoom repeatedly or leave the remaining days outside the view.
-        const plannedMarkers = routes.flatMap(route => route.spots)
-          .map(spot => markerRecords.current.get(spot.id)?.marker).filter(Boolean);
-        map.setFitView([...routed, ...plannedMarkers], false, [90, 75, 235, 390], 16);
+        const plannedMarkers = routes
+          .flatMap((route) => route.spots)
+          .map((spot) => markerRecords.current.get(spot.id)?.marker)
+          .filter(Boolean);
+        map.setFitView(
+          [...routed, ...plannedMarkers],
+          false,
+          [90, 75, 235, 390],
+          16,
+        );
       }
     }
   }, [mapReady, routeKey, endpointKey, activeDay, overviewOpen, city.center]);
@@ -3167,7 +3241,7 @@ function AiSheet({
         <button className="sheet-close" onClick={onClose}>
           ×
         </button>
-        <span>✦ DeepSeek-V4-Flash</span>
+        <span>✦ DeepSeek V4.1 Flash</span>
         <h2>一句话调整路线</h2>
         <textarea
           autoFocus
@@ -3206,13 +3280,21 @@ function Planner({
   days,
   stays,
   onBack,
+  importedTrip,
 }: {
   city: CityConfig;
   days: number;
   stays: Stay[];
   onBack: () => void;
+  importedTrip?: ImportedTrip | null;
 }) {
-  const [customSpots, setCustomSpots] = useState<Spot[]>([]);
+  const [customSpots, setCustomSpots] = useState<Spot[]>(
+    () =>
+      importedTrip?.spots.filter(
+        (spot) => !city.spots.some((item) => item.id === spot.id),
+      ) || [],
+  );
+  const importedOnce = useRef(false);
   const [discoveredSpots, setDiscoveredSpots] = useState<Spot[]>([]);
   const spots = useMemo(
     () => [...city.spots, ...discoveredSpots, ...customSpots],
@@ -3418,6 +3500,16 @@ function Planner({
     setActiveSpot(null);
   };
   const commitPlan = () => commitPlanWith(preferences, dayLocks);
+  useEffect(() => {
+    if (!importedTrip || importedOnce.current) return;
+    importedOnce.current = true;
+    const nextPreferences = Object.fromEntries(
+      importedTrip.spots.map((spot) => [spot.id, "like" as Preference]),
+    );
+    setPreferences(nextPreferences);
+    setDayLocks(importedTrip.locks);
+    commitPlanWith(nextPreferences, importedTrip.locks);
+  }, [importedTrip]);
   const clearSelection = () => {
     const resetEndpoints = initialEndpoints.map((endpoint) => ({
       ...endpoint,
@@ -4054,6 +4146,10 @@ function Planner({
 }
 
 export default function App() {
+  const [imageRequest, setImageRequest] = useState<ImageTripRequest | null>(
+    null,
+  );
+  const [importedTrip, setImportedTrip] = useState<ImportedTrip | null>(null);
   const [screen, setScreen] = useState<"setup" | "planner">("setup");
   const [cityId, setCityId] = useState<CityId | null>(null);
   const [days, setDays] = useState(3);
@@ -4080,6 +4176,7 @@ export default function App() {
   }, [city?.id]);
   const enter = async () => {
     if (!city || entering) return;
+    setImportedTrip(null);
     const cached = cityCache.current.get(city.id);
     if (cached) {
       setPreparedCity(cached);
@@ -4103,6 +4200,74 @@ export default function App() {
     setCityId(id);
     if (preparedCity?.id !== id) setPreparedCity(null);
   };
+  const importTrip = async (trip: ImportedTrip) => {
+    setEntering(true);
+    try {
+      const target = cityById(trip.cityId);
+      const prepared =
+        cityCache.current.get(target.id) || (await prepareCityCached(target));
+      cityCache.current.set(target.id, prepared);
+      const locks: Record<string, number> = {};
+      const canonicalSpots = trip.spots.map((spot) => {
+        const existing = prepared.spots.find(
+          (item) =>
+            item.id === spot.id ||
+            (item.name === spot.name && item.location === spot.location),
+        );
+        const canonical = existing || spot;
+        if (trip.locks[spot.id]) locks[canonical.id] = trip.locks[spot.id];
+        return canonical;
+      });
+      setImportedTrip({
+        ...trip,
+        spots: [
+          ...new Map(canonicalSpots.map((spot) => [spot.id, spot])).values(),
+        ],
+        locks,
+      });
+      setCityId(trip.cityId);
+      setDays(trip.days);
+      setStays([
+        {
+          id: "tentative",
+          place: null,
+          days: trip.days,
+          color: STAY_COLORS[0],
+        },
+      ]);
+      setPreparedCity({
+        ...prepared,
+        spots: [
+          ...prepared.spots,
+          ...canonicalSpots.filter(
+            (spot) => !prepared.spots.some((item) => item.id === spot.id),
+          ),
+        ],
+      });
+      setScreen("planner");
+      setImageRequest(null);
+    } finally {
+      setEntering(false);
+    }
+  };
+  const startImageTrip = async (request: ImageTripRequest) => {
+    setImportedTrip(null);
+    setCityId(request.cityId);
+    setDays(request.days);
+    setStays([
+      {
+        id: "tentative",
+        place: null,
+        days: request.days,
+        color: STAY_COLORS[0],
+      },
+    ]);
+    setPreparedCity(
+      cityCache.current.get(request.cityId) || cityById(request.cityId),
+    );
+    setImageRequest(request);
+    setScreen("planner");
+  };
   return screen === "setup" || !city || !preparedCity ? (
     <Setup
       cityId={cityId}
@@ -4113,14 +4278,35 @@ export default function App() {
       setStays={setStays}
       onEnter={enter}
       entering={entering}
+      onImport={startImageTrip}
     />
   ) : (
-    <Planner
-      key={preparedCity.id}
-      city={preparedCity}
-      days={days}
-      stays={stays}
-      onBack={() => setScreen("setup")}
-    />
+    <>
+      <Planner
+        key={preparedCity.id}
+        city={preparedCity}
+        days={days}
+        stays={stays}
+        onBack={() => setScreen("setup")}
+        importedTrip={importedTrip}
+      />
+      {imageRequest && (
+        <ImagePlanResolver
+          request={imageRequest}
+          onComplete={importTrip}
+          onCancel={() => {
+            setImageRequest(null);
+            setScreen("setup");
+          }}
+          resolve={async (id, name) => {
+            const chosenCity = cityById(id);
+            const pois = await searchPlaces(chosenCity.name, name, 5);
+            return pois
+              .map((poi, index) => spotFromPoi(chosenCity, poi, index, false))
+              .filter((spot): spot is Spot => !!spot);
+          }}
+        />
+      )}
+    </>
   );
 }

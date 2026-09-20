@@ -44,3 +44,5 @@ yarn-error.log*
 /work/
 /site-package.tgz
 /.sites/
+/OCR训练用/
+/.playwright-cli/

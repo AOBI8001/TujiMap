@@ -153,6 +153,7 @@ test(
       "cloudflare-worker.js",
       "cloud-functions/api/worker-impl.js",
       "cloud-functions/api/amap-gateway.js",
+      "cloud-functions/api/image-recognition.js",
     ].map((file) => ({
       type: "ESModule",
       path: resolve(file),

@@ -13,7 +13,8 @@ async function nodeRequestToWeb(
   const method = req.method || "GET";
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {
-    if (Array.isArray(value)) value.forEach((item) => headers.append(name, item));
+    if (Array.isArray(value))
+      value.forEach((item) => headers.append(name, item));
     else if (value != null) headers.set(name, value);
   }
   const init: RequestInit = { method, headers };
@@ -23,7 +24,9 @@ async function nodeRequestToWeb(
     for await (const chunk of req) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       length += buffer.length;
-      if (length > 50_000) throw new Error("请求内容过长");
+      const limit =
+        req.url?.split("?")[0] === "/api/recognize-image" ? 4_500_000 : 50_000;
+      if (length > limit) throw new Error("请求内容过长");
       chunks.push(buffer);
     }
     init.body = Buffer.concat(chunks);

@@ -6,7 +6,7 @@
 
 _基于真实地图与可解释启发式算法的城市多日旅行路线规划工具。_
 
-[![Version](https://img.shields.io/badge/version-1.3.0-168766)](CHANGELOG.md) [![React](https://img.shields.io/badge/React-19-2868e8)](https://react.dev/) [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6)](https://www.typescriptlang.org/) [![License](https://img.shields.io/badge/license-MIT-17211e)](LICENSE)
+[![Version](https://img.shields.io/badge/version-1.4.0-168766)](CHANGELOG.md) [![React](https://img.shields.io/badge/React-19-2868e8)](https://react.dev/) [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6)](https://www.typescriptlang.org/) [![License](https://img.shields.io/badge/license-MIT-17211e)](LICENSE)
 
 **随心成行，按途索迹。** 途迹把“发现景点、筛选景点、安排天数、生成真实导航”整合到同一张地图中，帮助用户得到少折返、可理解、可继续编辑的城市游览方案。
 
@@ -26,6 +26,8 @@ _基于真实地图与可解释启发式算法的城市多日旅行路线规划�
 
 当前版本覆盖 100 个国内城市，支持 1–7 天行程、多个住处、开放路线与闭合路线，并提供驾车、公共交通和纯步行三种真实道路导航。
 
+首页提供「自由选择」与「图片识别」两种入口。图片识别可将攻略截图或手绘地图中的地点转换为可核对的地点清单，减少反复抄写、搜索景点的操作。
+
 ## 🎯 产品设计
 
 ### 选择与规划分离
@@ -35,6 +37,16 @@ _基于真实地图与可解释启发式算法的城市多日旅行路线规划�
 ### 地图优先的信息层级
 
 地图承担主要信息展示：未选择的景点保留可见但降低视觉权重，已选择地点使用分日颜色和序号突出。桌面端使用固定导航侧栏，移动端使用可展开的全屏导航抽屉，确保路线细节不会长期遮挡地图。
+
+### 图片识别与地点校验
+
+图片入口支持点击或拖拽上传单张 JPG、PNG、WebP。图片在浏览器中缩放并重新编码，点击识别后交给 DeepSeek 提取单个城市内的地点，不让模型生成经纬度或道路路线。旅行天数由用户选择，不从图片推断。
+
+识别分为两个阶段：先提取路线标签及正文明确推荐的地点，再结合原图核验候选，补充遗漏并移除背景地名、泛称、重复项等。第二阶段使用增删差量保留未被否定的候选，减少整份重写造成的遗漏。服务端统一校验结构、规范化名称并去重，最多保留 40 个地点；两次模型请求共享 40 秒超时预算，不无限重试。
+
+识别后只需选择天数并勾选地点，点击「确认并规划」即进入地图。系统自动匹配真实地点，并显示定位进度；精确同名或规范化名称唯一匹配的候选自动采用，无法定位或有歧义的地点才需要补充确认，不静默丢弃或随意采用第一个结果。匹配搜索使用两个工作槽并复用高德限速网关。确认后的真实地点送入已有分天、顺序优化和三模式导航流程。
+
+当前图片入口按单个城市规划，不导入酒店住处；城市不明确时需要手动选择。模糊文字、同名地点及重复景区仍需人工核对，识图结果不等同于无误的地理数据。应用不持久化上传图片或将其用于训练，模型服务商的数据处理遵循其服务条款。
 
 ### 开放路线与闭合路线
 
@@ -148,7 +160,7 @@ Cloudflare 环境使用单个 Durable Object 协调本站所有 Worker 实例的
 | 规划层 | 去重、分天、最近邻、2-opt、开放/闭合路线 | 浏览器端确定性算法 |
 | 地图层 | 地图图面、POI、道路折线、公交步骤 | 高德 JS API 与 Web 服务 API |
 | 服务层 | 密钥隔离、参数校验、限速、重试、缓存、图片代理 | 边缘函数运行时 |
-| AI 层 | 中文意图解析与受限的路线修改指令 | DeepSeek-V4-Flash |
+| AI 层 | 中文意图解析、攻略识图与受限的路线修改指令 | DeepSeek（默认 API 模型标识：`deepseek-flash`） |
 
 前端基于 React、TypeScript 和 Vite 构建。[^3][^4][^5] 高德 Web 服务密钥、JS 安全密钥和 DeepSeek 密钥仅由服务端运行时读取；浏览器只访问同源业务接口和用于加载地图的 Web 端 Key。当前版本不包含账号系统，也不把行程写入数据库或浏览器持久化存储。
 
@@ -157,9 +169,12 @@ Cloudflare 环境使用单个 Durable Object 协调本站所有 Worker 实例的
 | 路径 | 内容 |
 | --- | --- |
 | `src/App.tsx` | 主要交互、选点状态、路线算法与地图渲染 |
+| `src/ImageImport.tsx` | 图片上传、识别状态与地点勾选 |
+| `src/ImagePlanResolver.tsx` | 识别地点自动定位、歧义确认与规划衔接 |
 | `src/data.ts` | 城市目录、重点城市基线景点与分日配色 |
-| `src/styles.css` | 桌面与移动端响应式视觉系统 |
+| `src/styles.css`、`src/image-import.css` | 响应式视觉系统与首页双入口面板 |
 | `cloud-functions/api/worker-impl.js` | 地点、路线、图片与 AI 同源 API |
+| `cloud-functions/api/image-recognition.js` | 图片校验、两阶段地点提取与结果规范化 |
 | `cloud-functions/api/amap-gateway.js` | 跨 Worker 实例共享的高德请求调度器 |
 | `cloudflare-worker.js` | 静态资源与同源 API 的边缘入口 |
 | `public/` | Logo、交通图标、PWA 与站点预览资源 |
