@@ -6,6 +6,103 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import ts from "typescript";
 import { RequestGate } from "../cloud-functions/api/amap-gateway.js";
+import { consumeDailyQuota, dailyWindow, withAiDailyQuota } from "../cloud-functions/api/ai-quota.js";
+
+test("AI daily quota allows exactly 30 submissions and resets at Beijing midnight", () => {
+  const now = Date.parse("2026-09-28T15:59:59Z");
+  assert.equal(dailyWindow(now).resetAt, Date.parse("2026-09-28T16:00:00Z"));
+  let state;
+  for (let i = 1; i <= 40; i++) {
+    const result = consumeDailyQuota(state, now);
+    assert.equal(result.allowed, i <= 30);
+    assert.equal(result.remaining, Math.max(0, 30 - i));
+    state = result.state;
+  }
+  const nextDay = consumeDailyQuota(state, Date.parse("2026-09-28T16:00:00Z"));
+  assert.equal(nextDay.allowed, true);
+  assert.equal(nextDay.remaining, 29);
+});
+
+test("AI quota fails closed, ignores spoofable identity and leaves non-AI requests unchanged", async () => {
+  let downstream = 0;
+  const next = async () => { downstream++; return new Response("original", { status: 202 }); };
+  const env = { DEEPSEEK_API_KEY: "quota-test-only" };
+  for (const path of ["/api/ai", "/api/recognize-image"]) {
+    const result = await withAiDailyQuota(new Request(`https://test.local${path}`, {
+      method: "POST", headers: { "x-forwarded-for": "192.0.2.1" },
+    }), env, next);
+    assert.equal(result.status, 503);
+  }
+  assert.equal(downstream, 0);
+  for (const path of ["/api/places", "/api/route", "/api/route-batch", "/api/status"]) {
+    const result = await withAiDailyQuota(new Request(`https://test.local${path}`, { method: "POST" }), env, next);
+    assert.equal(result.status, 202);
+    assert.equal(await result.text(), "original");
+  }
+  assert.equal(downstream, 4);
+});
+
+test("workerd: AI quota is atomic, shared by both AI endpoints and independent per IP", { timeout: 60000 }, async () => {
+  const require = createRequire(import.meta.url);
+  const wranglerRequire = createRequire(require.resolve("wrangler/package.json"));
+  const { Miniflare, convertV4MiniflareOptions } = await import(pathToFileURL(wranglerRequire.resolve("miniflare")).href);
+  let upstream = 0;
+  const mf = new Miniflare(convertV4MiniflareOptions({
+    name: "ai-quota-regression",
+    modules: ["cloudflare-worker.js", "cloud-functions/api/worker-impl.js", "cloud-functions/api/amap-gateway.js", "cloud-functions/api/image-recognition.js", "cloud-functions/api/ai-quota.js"].map(file => ({ type: "ESModule", path: resolve(file), contents: readFileSync(file, "utf8") })),
+    compatibilityDate: "2026-08-25",
+    bindings: { DEEPSEEK_API_KEY: "quota-test-only" },
+    durableObjects: { AI_DAILY_QUOTA: { className: "AiDailyQuota", useSQLite: true } },
+    outboundService: async request => {
+      upstream++;
+      const body = await request.json();
+      const result = body.max_tokens === 2600
+        ? { city: "北京", remove: [], add: [] }
+        : body.max_tokens === 3000
+          ? { city: "北京", places: [{ name: "故宫", role: "stop" }] }
+          : { spots: [{ name: "故宫", preference: "like" }], notes: [] };
+      return Response.json({ choices: [{ message: { content: JSON.stringify(result) } }] });
+    },
+  }));
+  const submit = (ip, path = "/api/ai", extraHeaders = {}, body) => mf.dispatchFetch(`https://test.local${path}`, {
+    method: "POST", headers: { "content-type": "application/json", "CF-Connecting-IP": ip, ...extraHeaders },
+    body: JSON.stringify(body || { text: "保留故宫", availableSpots: ["故宫"] }),
+  });
+  try {
+    await mf.ready;
+    const results = await Promise.all(Array.from({ length: 40 }, (_, i) => submit("192.0.2.1", "/api/ai", { "x-forwarded-for": `198.51.100.${i}` })));
+    assert.equal(results.filter(r => r.status === 200).length, 30);
+    assert.equal(results.filter(r => r.status === 429).length, 10);
+    assert.equal(upstream, 30, "blocked requests never invoke the model");
+    for (const response of results) {
+      assert.equal(response.headers.get("x-ai-daily-limit"), "30");
+      if (response.status === 429) assert.ok(Number(response.headers.get("retry-after")) > 0);
+      await response.text();
+    }
+    const blockedImage = await submit("192.0.2.1", "/api/recognize-image");
+    assert.equal(blockedImage.status, 429, "OCR and text share the same daily quota");
+    await blockedImage.text();
+    const image = await submit("192.0.2.2", "/api/recognize-image", {}, { image: "data:image/jpeg;base64,/9j/AAAA" });
+    assert.equal(image.status, 200);
+    assert.equal(image.headers.get("x-ai-daily-remaining"), "29");
+    assert.equal((await image.json()).places.length, 1);
+    assert.equal(upstream, 32, "two image passes consume one visitor submission");
+    const text = await submit("192.0.2.2");
+    assert.equal(text.status, 200);
+    assert.equal(text.headers.get("x-ai-daily-remaining"), "28");
+    await text.text();
+    const invalid = await submit("192.0.2.2", "/api/ai", {}, {});
+    assert.equal(invalid.status, 400, "original API status is preserved");
+    assert.equal(invalid.headers.get("x-ai-daily-remaining"), "27");
+    await invalid.text();
+    const status = await mf.dispatchFetch("https://test.local/api/status", { headers: { "CF-Connecting-IP": "192.0.2.1" } });
+    assert.equal(status.status, 200);
+    assert.equal(status.headers.get("x-ai-daily-limit"), null);
+    await status.text();
+  } finally {
+    await mf.dispose();
+  }
+});
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const peakQps = (starts) =>
@@ -154,6 +251,7 @@ test(
       "cloud-functions/api/worker-impl.js",
       "cloud-functions/api/amap-gateway.js",
       "cloud-functions/api/image-recognition.js",
+      "cloud-functions/api/ai-quota.js",
     ].map((file) => ({
       type: "ESModule",
       path: resolve(file),

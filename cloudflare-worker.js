@@ -3,6 +3,8 @@ import {
   proxyAmapJsService,
 } from "./cloud-functions/api/worker-impl.js";
 export { AmapGateway } from "./cloud-functions/api/amap-gateway.js";
+export { AiDailyQuota } from "./cloud-functions/api/ai-quota.js";
+import { withAiDailyQuota } from "./cloud-functions/api/ai-quota.js";
 
 /**
  * Cloudflare Workers 入口：
@@ -16,7 +18,9 @@ export default {
       return proxyAmapJsService(request, env);
     }
     if (url.pathname.startsWith("/api/")) {
-      return handleApiRequest(request, env, context);
+      return withAiDailyQuota(request, env, () =>
+        handleApiRequest(request, env, context),
+      );
     }
     return env.ASSETS.fetch(request);
   },
